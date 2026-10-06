@@ -1,2 +1,3 @@
 /target
 .prompts/*.log
+rustypipe_cache.json

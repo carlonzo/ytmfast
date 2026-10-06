@@ -1452,6 +1452,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastframe-icons"
+version = "0.4.1"
+source = "git+https://github.com/crmne/fastframe?tag=v0.4.1#23d87e048185ef317f272e2a67416f516b2f2b04"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5904,9 +5912,11 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "fastframe-icons",
  "image",
  "rodio",
  "rustypipe",
+ "serde_json",
  "tokio",
 ]
 

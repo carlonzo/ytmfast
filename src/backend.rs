@@ -10,27 +10,308 @@ pub struct Track {
     pub album: String,
     pub duration_secs: u32,
     pub thumb_url: Option<String>,
+    pub artist_id: Option<String>,
+    pub album_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CardKind {
+    Album,
+    Playlist,
+    Artist,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    pub kind: CardKind,
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub thumb_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct Shelf {
+    pub title: String,
+    pub cards: Vec<Card>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collection {
+    pub id: String,
+    pub title: String,
+    pub kind: CardKind,
+    pub subtitle: String,
+    pub thumb_url: Option<String>,
+    pub tracks: Vec<Track>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistPage {
+    pub id: String,
+    pub name: String,
+    pub thumb_url: Option<String>,
+    pub subscribers: Option<String>,
+    pub top_songs: Vec<Track>,
+    pub albums: Vec<Card>,
+    pub singles: Vec<Card>,
+    pub radio_id: Option<String>,
+    pub tracks_playlist_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub top_songs: Vec<Track>,
+    pub new_releases: Vec<Card>,
+    pub chart_playlists: Vec<Card>,
+    pub chart_artists: Vec<Card>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchAll {
+    pub query: String,
+    pub songs: Vec<Track>,
+    pub albums: Vec<Card>,
+    pub artists: Vec<Card>,
+    pub playlists: Vec<Card>,
 }
 
 pub enum Cmd {
+    LoadHome,
     Search(String),
+    OpenAlbum(String),
+    OpenPlaylist(String),
+    OpenArtist(String),
+    Radio(String),
     Fetch(Track),
 }
 
 pub enum Event {
-    SearchResults { query: String, tracks: Vec<Track> },
+    Home(Home),
+    HomeError(String),
+    SearchResults(SearchAll),
     SearchError { query: String, error: String },
+    Collection(Collection),
+    Artist(ArtistPage),
+    Radio { id: String, tracks: Vec<Track> },
+    PageError { id: String, error: String },
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
 }
 
-fn select_thumbnail(covers: &[rustypipe::model::Thumbnail]) -> Option<String> {
+pub fn select_thumbnail_min(covers: &[rustypipe::model::Thumbnail], min_width: u32) -> Option<String> {
+    if covers.is_empty() {
+        return None;
+    }
     covers
         .iter()
-        .filter(|t| t.width >= 80)
+        .filter(|t| t.width >= min_width)
         .min_by_key(|t| t.width)
-        .or_else(|| covers.last())
+        .or_else(|| covers.iter().max_by_key(|t| t.width))
         .map(|t| t.url.clone())
+}
+
+pub fn select_thumbnail_largest(covers: &[rustypipe::model::Thumbnail]) -> Option<String> {
+    covers.iter().max_by_key(|t| t.width).map(|t| t.url.clone())
+}
+
+pub fn select_thumbnail(covers: &[rustypipe::model::Thumbnail]) -> Option<String> {
+    select_thumbnail_min(covers, 80)
+}
+
+pub fn join_artists(artists: &[rustypipe::model::ArtistId]) -> String {
+    artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn format_subscriber_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        let val = count as f64 / 1_000_000.0;
+        let s = format!("{val:.1}");
+        let s = s.strip_suffix(".0").unwrap_or(&s);
+        format!("{s}M")
+    } else if count >= 1_000 {
+        let val = count as f64 / 1_000.0;
+        let s = format!("{val:.1}");
+        let s = s.strip_suffix(".0").unwrap_or(&s);
+        format!("{s}K")
+    } else {
+        count.to_string()
+    }
+}
+
+pub fn format_subscribers_label(count: Option<u64>) -> Option<String> {
+    count.map(|c| format!("{} subscribers", format_subscriber_count(c)))
+}
+
+pub fn format_duration_human(total_secs: u32) -> String {
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    if hours > 0 {
+        if mins > 0 {
+            format!("{hours} hr {mins} min")
+        } else {
+            format!("{hours} hr")
+        }
+    } else if mins == 1 {
+        "1 minute".to_string()
+    } else {
+        format!("{mins} minutes")
+    }
+}
+
+pub fn format_songs_and_duration(count: usize, total_secs: u32) -> String {
+    let song_str = if count == 1 {
+        "1 song".to_string()
+    } else {
+        format!("{count} songs")
+    };
+    if total_secs > 0 {
+        format!("{song_str} • {}", format_duration_human(total_secs))
+    } else {
+        song_str
+    }
+}
+
+pub fn format_collection_subtitle(
+    kind: CardKind,
+    artist: Option<&str>,
+    year: Option<u16>,
+    track_count: usize,
+    total_secs: u32,
+) -> String {
+    let mut parts = Vec::new();
+    match kind {
+        CardKind::Album => parts.push("Album".to_string()),
+        CardKind::Playlist => parts.push("Playlist".to_string()),
+        CardKind::Artist => parts.push("Artist".to_string()),
+    }
+    if let Some(art) = artist {
+        let trimmed = art.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if let Some(y) = year {
+        parts.push(y.to_string());
+    }
+    let songs_dur = format_songs_and_duration(track_count, total_secs);
+    if !songs_dur.is_empty() {
+        parts.push(songs_dur);
+    }
+    parts.join(" • ")
+}
+
+pub fn track_from(item: rustypipe::model::TrackItem) -> Track {
+    let artist = join_artists(&item.artists);
+    let album = item.album.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+    let album_id = item.album.map(|a| a.id);
+    let thumb_url = select_thumbnail(&item.cover);
+    Track {
+        id: item.id,
+        title: item.name,
+        artist,
+        album,
+        duration_secs: item.duration.unwrap_or(0),
+        thumb_url,
+        artist_id: item.artist_id,
+        album_id,
+    }
+}
+
+pub fn track_from_album_track(
+    item: rustypipe::model::TrackItem,
+    album: &rustypipe::model::MusicAlbum,
+) -> Track {
+    let artist = if item.artists.is_empty() {
+        join_artists(&album.artists)
+    } else {
+        join_artists(&item.artists)
+    };
+    let album_title = item
+        .album
+        .as_ref()
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| album.name.clone());
+    let thumb_url = select_thumbnail(&item.cover).or_else(|| select_thumbnail(&album.cover));
+    Track {
+        id: item.id,
+        title: item.name,
+        artist,
+        album: album_title,
+        duration_secs: item.duration.unwrap_or(0),
+        thumb_url,
+        artist_id: item.artist_id.or_else(|| album.artist_id.clone()),
+        album_id: Some(album.id.clone()),
+    }
+}
+
+pub fn album_card(a: rustypipe::model::AlbumItem) -> Card {
+    let artist = join_artists(&a.artists);
+    let year_str = a.year.map(|y| y.to_string());
+    let mut subtitle_parts = vec!["Album"];
+    if !artist.is_empty() {
+        subtitle_parts.push(&artist);
+    }
+    let year_formatted = year_str.as_deref().unwrap_or("");
+    if !year_formatted.is_empty() {
+        subtitle_parts.push(year_formatted);
+    }
+    Card {
+        kind: CardKind::Album,
+        id: a.id,
+        title: a.name,
+        subtitle: subtitle_parts.join(" • "),
+        thumb_url: select_thumbnail_min(&a.cover, 226),
+    }
+}
+
+pub fn playlist_card(p: rustypipe::model::MusicPlaylistItem) -> Card {
+    let channel_name = p
+        .channel
+        .as_ref()
+        .map(|c| c.name.as_str())
+        .unwrap_or("YouTube Music");
+    Card {
+        kind: CardKind::Playlist,
+        id: p.id,
+        title: p.name,
+        subtitle: format!("Playlist • {channel_name}"),
+        thumb_url: select_thumbnail_min(&p.thumbnail, 226),
+    }
+}
+
+pub fn artist_card(a: rustypipe::model::ArtistItem) -> Card {
+    let subtitle = match a.subscriber_count {
+        Some(count) => format!("Artist • {} subscribers", format_subscriber_count(count)),
+        None => "Artist".to_string(),
+    };
+    Card {
+        kind: CardKind::Artist,
+        id: a.id,
+        title: a.name,
+        subtitle,
+        thumb_url: select_thumbnail_min(&a.avatar, 226),
+    }
+}
+
+pub fn split_artist_albums(
+    items: Vec<rustypipe::model::AlbumItem>,
+) -> (Vec<Card>, Vec<Card>) {
+    let mut albums = Vec::new();
+    let mut singles = Vec::new();
+    for item in items {
+        if item.album_type == rustypipe::model::AlbumType::Single {
+            singles.push(album_card(item));
+        } else {
+            albums.push(album_card(item));
+        }
+    }
+    (albums, singles)
 }
 
 pub struct Backend {
@@ -57,7 +338,10 @@ impl Backend {
                 .unwrap_or_else(|| PathBuf::from("/tmp/ytmfast"));
             let _ = std::fs::create_dir_all(&data_dir);
 
-            let (rp, rp_err) = match rustypipe::client::RustyPipe::builder().storage_dir(&data_dir).build() {
+            let (rp, rp_err) = match rustypipe::client::RustyPipe::builder()
+                .storage_dir(&data_dir)
+                .build()
+            {
                 Ok(rp) => (Some(Arc::new(rp)), None),
                 Err(e) => (None, Some(format!("RustyPipe init error: {e}"))),
             };
@@ -73,35 +357,125 @@ impl Backend {
                 if let Some(rt_ref) = &rt {
                     rt_ref.spawn(async move {
                         match cmd {
+                            Cmd::LoadHome => {
+                                if let Some(rp) = rp {
+                                    let q1 = rp.query();
+                                    let q2 = rp.query();
+                                    let (charts_res, new_albums_res) = tokio::join!(
+                                        q1.music_charts(None),
+                                        q2.music_new_albums(),
+                                    );
+                                    match charts_res {
+                                        Ok(charts) => {
+                                            let mut top_songs: Vec<Track> = charts
+                                                .top_tracks
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect();
+                                            if top_songs.is_empty()
+                                                && let Some(first_pl) = charts.playlists.first()
+                                            {
+                                                let res = rp.query().music_playlist(&first_pl.id).await;
+                                                if let Ok(pl) = res {
+                                                    top_songs = pl
+                                                        .tracks
+                                                        .items
+                                                        .into_iter()
+                                                        .map(track_from)
+                                                        .collect();
+                                                }
+                                            }
+                                            let chart_artists = charts
+                                                .artists
+                                                .into_iter()
+                                                .map(artist_card)
+                                                .collect();
+                                            let chart_playlists = charts
+                                                .playlists
+                                                .into_iter()
+                                                .map(playlist_card)
+                                                .collect();
+                                            let new_releases = new_albums_res
+                                                .map(|albums| {
+                                                    albums.into_iter().map(album_card).collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let _ = event_tx.send(Event::Home(Home {
+                                                top_songs,
+                                                new_releases,
+                                                chart_playlists,
+                                                chart_artists,
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::HomeError(e.to_string()));
+                                        }
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::HomeError(err));
+                                }
+                                ctx.request_repaint();
+                            }
                             Cmd::Search(query) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_search_tracks(&query).await {
+                                    let q1 = rp.query();
+                                    let q2 = rp.query();
+                                    let q3 = rp.query();
+                                    let q4 = rp.query();
+                                    let (tracks_res, albums_res, artists_res, playlists_res) =
+                                        tokio::join!(
+                                            q1.music_search_tracks(&query),
+                                            q2.music_search_albums(&query),
+                                            q3.music_search_artists(&query),
+                                            q4.music_search_playlists(&query, false),
+                                        );
+                                    match tracks_res {
                                         Ok(res) => {
-                                            let tracks = res
+                                            let songs = res
                                                 .items
                                                 .items
                                                 .into_iter()
-                                                .map(|item| {
-                                                    let artist = item
-                                                        .artists
-                                                        .iter()
-                                                        .map(|a| a.name.as_str())
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ");
-                                                    let album =
-                                                        item.album.map(|a| a.name).unwrap_or_default();
-                                                    let thumb_url = select_thumbnail(&item.cover);
-                                                    Track {
-                                                        id: item.id,
-                                                        title: item.name,
-                                                        artist,
-                                                        album,
-                                                        duration_secs: item.duration.unwrap_or(0),
-                                                        thumb_url,
-                                                    }
-                                                })
+                                                .map(track_from)
                                                 .collect();
-                                            let _ = event_tx.send(Event::SearchResults { query, tracks });
+                                            let albums = albums_res
+                                                .map(|r| {
+                                                    r.items
+                                                        .items
+                                                        .into_iter()
+                                                        .map(album_card)
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let artists = artists_res
+                                                .map(|r| {
+                                                    r.items
+                                                        .items
+                                                        .into_iter()
+                                                        .map(artist_card)
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let playlists = playlists_res
+                                                .map(|r| {
+                                                    r.items
+                                                        .items
+                                                        .into_iter()
+                                                        .map(playlist_card)
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let _ = event_tx.send(Event::SearchResults(
+                                                SearchAll {
+                                                    query,
+                                                    songs,
+                                                    albums,
+                                                    artists,
+                                                    playlists,
+                                                },
+                                            ));
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(Event::SearchError {
@@ -111,8 +485,193 @@ impl Backend {
                                         }
                                     }
                                 } else {
-                                    let err = rp_err.unwrap_or_else(|| "RustyPipe init failed".to_string());
-                                    let _ = event_tx.send(Event::SearchError { query, error: err });
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::SearchError {
+                                        query,
+                                        error: err,
+                                    });
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::OpenAlbum(id) => {
+                                if let Some(rp) = rp {
+                                    match rp.query().music_album(&id).await {
+                                        Ok(album) => {
+                                            let total_secs: u32 = album
+                                                .tracks
+                                                .iter()
+                                                .map(|t| t.duration.unwrap_or(0))
+                                                .sum();
+                                            let artist_line = join_artists(&album.artists);
+                                            let subtitle = format_collection_subtitle(
+                                                CardKind::Album,
+                                                if artist_line.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(&artist_line)
+                                                },
+                                                album.year,
+                                                album.tracks.len(),
+                                                total_secs,
+                                            );
+                                            let thumb_url =
+                                                select_thumbnail_largest(&album.cover);
+                                            let tracks = album
+                                                .tracks
+                                                .iter()
+                                                .cloned()
+                                                .map(|t| track_from_album_track(t, &album))
+                                                .collect();
+                                            let _ = event_tx.send(Event::Collection(
+                                                Collection {
+                                                    id: album.id,
+                                                    title: album.name,
+                                                    kind: CardKind::Album,
+                                                    subtitle,
+                                                    thumb_url,
+                                                    tracks,
+                                                },
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::PageError {
+                                                id,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::OpenPlaylist(id) => {
+                                if let Some(rp) = rp {
+                                    match rp.query().music_playlist(&id).await {
+                                        Ok(playlist) => {
+                                            let total_secs: u32 = playlist
+                                                .tracks
+                                                .items
+                                                .iter()
+                                                .map(|t| t.duration.unwrap_or(0))
+                                                .sum();
+                                            let channel_name =
+                                                playlist.channel.as_ref().map(|c| c.name.clone());
+                                            let subtitle = format_collection_subtitle(
+                                                CardKind::Playlist,
+                                                channel_name.as_deref().or(if playlist.from_ytm {
+                                                    Some("YouTube Music")
+                                                } else {
+                                                    None
+                                                }),
+                                                None,
+                                                playlist.tracks.items.len(),
+                                                total_secs,
+                                            );
+                                            let thumb_url =
+                                                select_thumbnail_largest(&playlist.thumbnail);
+                                            let tracks = playlist
+                                                .tracks
+                                                .items
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect();
+                                            let _ = event_tx.send(Event::Collection(
+                                                Collection {
+                                                    id: playlist.id,
+                                                    title: playlist.name,
+                                                    kind: CardKind::Playlist,
+                                                    subtitle,
+                                                    thumb_url,
+                                                    tracks,
+                                                },
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::PageError {
+                                                id,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::OpenArtist(id) => {
+                                if let Some(rp) = rp {
+                                    match rp.query().music_artist(&id, false).await {
+                                        Ok(artist) => {
+                                            let thumb_url =
+                                                select_thumbnail_largest(&artist.header_image);
+                                            let subscribers =
+                                                format_subscribers_label(artist.subscriber_count);
+                                            let top_songs = artist
+                                                .tracks
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect();
+                                            let (albums, singles) =
+                                                split_artist_albums(artist.albums);
+                                            let _ = event_tx.send(Event::Artist(ArtistPage {
+                                                id: artist.id,
+                                                name: artist.name,
+                                                thumb_url,
+                                                subscribers,
+                                                top_songs,
+                                                albums,
+                                                singles,
+                                                radio_id: artist.radio_id,
+                                                tracks_playlist_id: artist.tracks_playlist_id,
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::PageError {
+                                                id,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::Radio(id) => {
+                                if let Some(rp) = rp {
+                                    match rp.query().music_radio_track(&id).await {
+                                        Ok(paginator) => {
+                                            let tracks = paginator
+                                                .items
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect();
+                                            let _ = event_tx.send(Event::Radio { id, tracks });
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::PageError {
+                                                id,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::PageError { id, error: err });
                                 }
                                 ctx.request_repaint();
                             }
@@ -138,8 +697,14 @@ impl Backend {
                 } else {
                     let err = rt_err.unwrap_or_else(|| "Runtime init failed".to_string());
                     match cmd {
+                        Cmd::LoadHome => {
+                            let _ = event_tx.send(Event::HomeError(err));
+                        }
                         Cmd::Search(query) => {
                             let _ = event_tx.send(Event::SearchError { query, error: err });
+                        }
+                        Cmd::OpenAlbum(id) | Cmd::OpenPlaylist(id) | Cmd::OpenArtist(id) | Cmd::Radio(id) => {
+                            let _ = event_tx.send(Event::PageError { id, error: err });
                         }
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
@@ -162,5 +727,186 @@ impl Backend {
 
     pub fn try_recv(&self) -> Option<Event> {
         self.rx.try_recv().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustypipe::model::Thumbnail;
+
+    fn make_thumbnail(url: &str, width: u32, height: u32) -> Thumbnail {
+        serde_json::from_value(serde_json::json!({
+            "url": url,
+            "width": width,
+            "height": height,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_select_thumbnail_min_and_largest() {
+        let empty: Vec<Thumbnail> = vec![];
+        assert_eq!(select_thumbnail_min(&empty, 100), None);
+        assert_eq!(select_thumbnail_largest(&empty), None);
+
+        let thumbs = vec![
+            make_thumbnail("https://example.com/small.jpg", 60, 60),
+            make_thumbnail("https://example.com/medium.jpg", 120, 120),
+            make_thumbnail("https://example.com/large.jpg", 500, 500),
+        ];
+
+        // min 80 -> picks medium (120 >= 80, smallest among >= 80)
+        assert_eq!(
+            select_thumbnail_min(&thumbs, 80),
+            Some("https://example.com/medium.jpg".to_string())
+        );
+
+        // min 200 -> picks large (500)
+        assert_eq!(
+            select_thumbnail_min(&thumbs, 200),
+            Some("https://example.com/large.jpg".to_string())
+        );
+
+        // min 600 (none >= 600) -> picks largest available (500)
+        assert_eq!(
+            select_thumbnail_min(&thumbs, 600),
+            Some("https://example.com/large.jpg".to_string())
+        );
+
+        // largest -> picks 500
+        assert_eq!(
+            select_thumbnail_largest(&thumbs),
+            Some("https://example.com/large.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_subscriber_count() {
+        assert_eq!(format_subscriber_count(1_200_000), "1.2M");
+        assert_eq!(format_subscriber_count(1_000_000), "1M");
+        assert_eq!(format_subscriber_count(450_000), "450K");
+        assert_eq!(format_subscriber_count(1_500), "1.5K");
+        assert_eq!(format_subscriber_count(999), "999");
+        assert_eq!(
+            format_subscribers_label(Some(1_200_000)),
+            Some("1.2M subscribers".to_string())
+        );
+        assert_eq!(format_subscribers_label(None), None);
+    }
+
+    #[test]
+    fn test_duration_and_collection_formatting() {
+        assert_eq!(format_duration_human(60), "1 minute");
+        assert_eq!(format_duration_human(300), "5 minutes");
+        assert_eq!(format_duration_human(3600), "1 hr");
+        assert_eq!(format_duration_human(3660), "1 hr 1 min");
+
+        assert_eq!(
+            format_songs_and_duration(1, 180),
+            "1 song • 3 minutes"
+        );
+        assert_eq!(
+            format_songs_and_duration(12, 48 * 60),
+            "12 songs • 48 minutes"
+        );
+
+        assert_eq!(
+            format_collection_subtitle(
+                CardKind::Album,
+                Some("Daft Punk"),
+                Some(2001),
+                14,
+                3660,
+            ),
+            "Album • Daft Punk • 2001 • 14 songs • 1 hr 1 min"
+        );
+    }
+
+    #[test]
+    fn test_split_artist_albums() {
+        use rustypipe::model::AlbumItem;
+
+        fn make_album_item(id: &str, name: &str, album_type: &str, year: Option<u16>) -> AlbumItem {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": name,
+                "cover": [],
+                "artists": [],
+                "album_type": album_type,
+                "year": year,
+                "by_va": false,
+            }))
+            .unwrap()
+        }
+
+        let items = vec![
+            make_album_item("album_1", "Discovery", "album", Some(2001)),
+            make_album_item("single_1", "One More Time", "single", Some(2000)),
+            make_album_item("ep_1", "Tron EP", "ep", Some(2010)),
+        ];
+
+        let (albums, singles) = split_artist_albums(items);
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].id, "album_1");
+        assert_eq!(albums[1].id, "ep_1");
+        assert_eq!(singles.len(), 1);
+        assert_eq!(singles[0].id, "single_1");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_network_home_and_album_mapping() {
+        let rp = rustypipe::client::RustyPipe::builder().build().unwrap();
+        let q1 = rp.query();
+        let q2 = rp.query();
+        let (charts_res, new_albums_res) = tokio::join!(
+            q1.music_charts(Some(rustypipe::param::Country::Us)),
+            q2.music_new_albums(),
+        );
+
+        let charts = charts_res.expect("music_charts failed");
+        let new_albums = new_albums_res.expect("music_new_albums failed");
+
+        eprintln!(
+            "Charts debug: top_tracks={}, trending_tracks={}, artists={}, playlists={}, top_pl_id={:?}",
+            charts.top_tracks.len(),
+            charts.trending_tracks.len(),
+            charts.artists.len(),
+            charts.playlists.len(),
+            charts.top_playlist_id,
+        );
+        for p in charts.playlists.iter().take(5) {
+            eprintln!("  playlist: id={} name={}", p.id, p.name);
+        }
+
+        let mut top_songs: Vec<Track> = charts.top_tracks.into_iter().map(track_from).collect();
+        if top_songs.is_empty()
+            && let Some(first_pl) = charts.playlists.first()
+        {
+            let res = rp.query().music_playlist(&first_pl.id).await;
+            if let Ok(pl) = res {
+                top_songs = pl.tracks.items.into_iter().map(track_from).collect();
+            }
+        }
+        let new_releases: Vec<Card> = new_albums.into_iter().map(album_card).collect();
+
+        assert!(!top_songs.is_empty(), "top songs should not be empty");
+        assert!(!new_releases.is_empty(), "new releases should not be empty");
+
+        // Fetch first album
+        let first_album_id = &new_releases[0].id;
+        let album = rp.query().music_album(first_album_id).await.expect("music_album failed");
+        assert_eq!(&album.id, first_album_id);
+        assert!(!album.tracks.is_empty(), "album tracks should not be empty");
+
+        let tracks: Vec<Track> = album
+            .tracks
+            .iter()
+            .cloned()
+            .map(|t| track_from_album_track(t, &album))
+            .collect();
+        assert!(!tracks.is_empty());
+        assert_eq!(tracks[0].album, album.name);
     }
 }

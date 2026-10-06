@@ -12,3 +12,7 @@ rustypipe = { version = "0.11.4", features = ["rustls-tls-native-roots", "userda
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time"] }
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 directories = "6"
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+
+[dev-dependencies]
+serde_json = "1"

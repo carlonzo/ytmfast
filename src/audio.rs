@@ -396,6 +396,8 @@ mod tests {
                 album: format!("Album {i}"),
                 duration_secs: 180 + i as u32,
                 thumb_url: None,
+                artist_id: None,
+                album_id: None,
             })
             .collect()
     }
