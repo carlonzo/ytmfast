@@ -1,0 +1,22 @@
+You are fixing review findings in `ytmfast`, a native YouTube Music desktop client in Rust + egui (eframe 0.36, rodio 0.22, rustypipe 0.11.4 for metadata, yt-dlp subprocess for audio download). Work ONLY in /home/carlo/claude-rc/ytmfast (git repo; last commit "Milestone 1: core playback"). Read PLAN.md and .prompts/m1.txt for the spec, then the sources src/main.rs, src/backend.rs, src/audio.rs, src/ui.rs.
+Keep diffs small; no new abstractions beyond what is listed. The UI thread must never block on network/subprocess. No unwrap on fallible runtime paths. Never log cookies.
+
+Fix list (line numbers approximate):
+1. [BLOCKER] main.rs PlayFrom/Next/Prev/auto_advance + audio.rs Player: when switching tracks only a Fetch is sent and the OLD audio keeps playing while the new one downloads (~4 s). If the old track ends during that download, is_finished() fires auto_advance, which skips the clicked track (its Ready is then dropped as stale). Also old audio plays under the new title, the bar shows old position/duration, and Prev's ">3 s restart" check seeks the old track.
+   Fix: add `Player::stop()` (drop/stop the current rodio player/sink, set has_source=false, current_duration=None). Introduce ONE helper in main.rs, e.g. `fn start_track(&mut self, track: Track)`, that stops the player, sets the loading state/current track, and sends Cmd::Fetch; use it from PlayFrom, Next, Prev and auto-advance (removes the duplicated blocks). Ensure is_finished() cannot be true while a track is loading (no source => not "finished").
+2. [should] ui.rs progress bar (~line 255): dragging calls Seek every frame; try_seek blocks ~41 ms and stutters. While dragging, only draw the preview position (store drag fraction in UI state); emit Action::Seek once on `clicked() || drag_stopped()`.
+3. [should] main.rs PlayFrom: Queue::new resets shuffle and repeat. Carry over the previous repeat mode and call set_shuffle(previous_shuffle) on the new queue (shuffle must keep the clicked track as current).
+4. [should] audio.rs fetch: two concurrent fetches of the same uncached id (double-click) run two yt-dlp processes on the same temp path; the second fails with "output file not found". Fix: after yt-dlp exits (success or failure), if the final path exists return Ok(final_path). Additionally, in main.rs ignore PlayFrom for the track that is already current AND loading.
+5. [nit] backend.rs: if rustypipe/runtime init fails the backend thread exits and later searches spin forever and Fetch stops working. Keep the command loop alive: Fetch still works, Search replies SearchError("...init failed...").
+6. [nit] Event::SearchError must carry the query; main.rs ignores errors whose query != current query (like SearchResults).
+7. [nit] main.rs: the 250 ms request_repaint_after should only run while playing (not paused) or while loading.
+8. [nit] backend.rs thumbnail: instead of cover.last() (largest), pick the smallest thumbnail with width >= 80, falling back to the largest.
+9. [nit] Fix the clippy lints: collapsible ifs (audio.rs ~319-320, ui.rs ~255), needless borrow audio.rs ~268 (`&sink.mixer()`). `cargo clippy` should be clean.
+10. [nit] Tests in audio.rs: add user-next at end of list in repeat One (wraps to index 0, consistent with current semantics) and repeat Off on an empty queue (next/prev/current return None, no panic).
+11. Add `.prompts/*.log` to .gitignore and `git rm --cached` any committed .prompts/*.log file.
+
+Acceptance (iterate until all pass):
+- `cargo build` zero warnings; `cargo clippy` zero warnings; `cargo test` passes; `cargo test -- --ignored` passes (network available).
+- `timeout 10 cargo run` exits 124 with no panic.
+- Commit: `git add -A && git commit -m "Milestone 1: review fixes (track switch stop, seek on release, keep shuffle/repeat, dedupe fetch)"`. Do not push.
+Print a short summary: what changed per item, `wc -l src/*.rs`, test results.

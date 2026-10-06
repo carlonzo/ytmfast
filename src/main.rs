@@ -43,14 +43,21 @@ impl App {
         }
     }
 
+    fn start_track(&mut self, track: Track) {
+        self.player.stop();
+        self.is_active_playback = true;
+        self.is_loading = true;
+        self.fetch_error = None;
+        self.backend.send(Cmd::Fetch(track));
+    }
+
     fn auto_advance(&mut self) {
         if let Some(track) = self.queue.next(false).cloned() {
-            self.is_loading = true;
-            self.fetch_error = None;
-            self.backend.send(Cmd::Fetch(track));
+            self.start_track(track);
         } else {
             self.is_active_playback = false;
             self.is_loading = false;
+            self.player.stop();
         }
     }
 
@@ -63,12 +70,18 @@ impl App {
                 self.backend.send(Cmd::Search(query));
             }
             Action::PlayFrom(index) => {
+                if self.is_loading
+                    && self.queue.current().map(|t| &t.id) == self.results.get(index).map(|t| &t.id)
+                {
+                    return;
+                }
+                let prev_repeat = self.queue.repeat;
+                let prev_shuffle = self.queue.shuffle;
                 self.queue = Queue::new(self.results.clone(), index);
+                self.queue.repeat = prev_repeat;
+                self.queue.set_shuffle(prev_shuffle);
                 if let Some(track) = self.queue.current().cloned() {
-                    self.is_active_playback = true;
-                    self.is_loading = true;
-                    self.fetch_error = None;
-                    self.backend.send(Cmd::Fetch(track));
+                    self.start_track(track);
                 }
             }
             Action::TogglePlayPause => {
@@ -76,23 +89,18 @@ impl App {
             }
             Action::NextTrack(user) => {
                 if let Some(track) = self.queue.next(user).cloned() {
-                    self.is_active_playback = true;
-                    self.is_loading = true;
-                    self.fetch_error = None;
-                    self.backend.send(Cmd::Fetch(track));
+                    self.start_track(track);
                 } else {
                     self.is_active_playback = false;
                     self.is_loading = false;
+                    self.player.stop();
                 }
             }
             Action::PrevTrack => {
                 if self.player.position() > Duration::from_secs(3) {
                     self.player.seek(Duration::ZERO);
                 } else if let Some(track) = self.queue.prev().cloned() {
-                    self.is_active_playback = true;
-                    self.is_loading = true;
-                    self.fetch_error = None;
-                    self.backend.send(Cmd::Fetch(track));
+                    self.start_track(track);
                 }
             }
             Action::Seek(pos) => {
@@ -126,9 +134,11 @@ impl eframe::App for App {
                         self.search_error = None;
                     }
                 }
-                Event::SearchError(err) => {
-                    self.is_searching = false;
-                    self.search_error = Some(err);
+                Event::SearchError { query, error } => {
+                    if query == self.current_search_query {
+                        self.is_searching = false;
+                        self.search_error = Some(error);
+                    }
                 }
                 Event::Ready { id, path } => {
                     if self.queue.current().map(|t| t.id.as_str()) == Some(&id) {
@@ -150,11 +160,15 @@ impl eframe::App for App {
         }
 
         // Repaint and auto-advance
-        if self.is_active_playback {
+        if self.is_loading || (self.is_active_playback && !self.player.is_paused()) {
             ctx.request_repaint_after(Duration::from_millis(250));
-            if !self.player.is_paused() && self.player.is_finished() {
-                self.auto_advance();
-            }
+        }
+        if self.is_active_playback
+            && !self.is_loading
+            && !self.player.is_paused()
+            && self.player.is_finished()
+        {
+            self.auto_advance();
         }
 
         let mut actions = Vec::new();

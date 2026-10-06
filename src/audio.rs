@@ -188,14 +188,23 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     let _ = tokio::fs::remove_file(&temp_path).await;
 
     let args = ytdlp_args(id, &temp_path, cookies);
-    let output = tokio::process::Command::new("yt-dlp")
+    let output_res = tokio::process::Command::new("yt-dlp")
         .args(&args)
         .output()
-        .await
-        .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+        .await;
+
+    if final_path.exists() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Ok(final_path);
+    }
+
+    let output = output_res.map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
 
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&temp_path).await;
+        if final_path.exists() {
+            return Ok(final_path);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let msg = stderr.lines().take(5).collect::<Vec<_>>().join(" ");
         return Err(format!(
@@ -206,12 +215,18 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     }
 
     if !temp_path.exists() {
+        if final_path.exists() {
+            return Ok(final_path);
+        }
         return Err("yt-dlp completed but output file not found".to_string());
     }
 
-    tokio::fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|e| format!("Failed to save cached audio: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+        if final_path.exists() {
+            return Ok(final_path);
+        }
+        return Err(format!("Failed to save cached audio: {e}"));
+    }
 
     Ok(final_path)
 }
@@ -265,7 +280,7 @@ impl Player {
         let dur = rodio::Source::total_duration(&decoder);
         self.current_duration = dur;
 
-        let new_player = rodio::Player::connect_new(&sink.mixer());
+        let new_player = rodio::Player::connect_new(sink.mixer());
         new_player.set_volume(self.volume);
         new_player.append(decoder);
         new_player.play();
@@ -315,16 +330,21 @@ impl Player {
         self.volume
     }
 
-    pub fn is_finished(&mut self) -> bool {
-        if self.has_source {
-            if let Some(p) = &self.player {
-                if p.empty() {
-                    self.has_source = false;
-                    return true;
-                }
-            }
+    pub fn stop(&mut self) {
+        if let Some(p) = self.player.take() {
+            p.stop();
         }
-        false
+        self.has_source = false;
+        self.current_duration = None;
+    }
+
+    pub fn is_finished(&mut self) -> bool {
+        if self.has_source && self.player.as_ref().is_some_and(|p| p.empty()) {
+            self.has_source = false;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -432,6 +452,19 @@ mod tests {
         assert_eq!(q.next(false).unwrap().id, "test_id_0000");
         // User next advances even in Repeat One
         assert_eq!(q.next(true).unwrap().id, "test_id_0001");
+        assert_eq!(q.next(true).unwrap().id, "test_id_0002");
+        // User next at end of list in Repeat One wraps to index 0
+        assert_eq!(q.next(true).unwrap().id, "test_id_0000");
+    }
+
+    #[test]
+    fn test_empty_queue() {
+        let mut q = Queue::new(Vec::new(), 0);
+        assert_eq!(q.repeat, Repeat::Off);
+        assert!(q.current().is_none());
+        assert!(q.next(false).is_none());
+        assert!(q.next(true).is_none());
+        assert!(q.prev().is_none());
     }
 
     #[test]

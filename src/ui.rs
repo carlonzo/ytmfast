@@ -246,19 +246,39 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 0.0
             };
 
+            let drag_id = ui.id().with("progress_drag_fraction");
+            let mut drag_frac: Option<f32> = ui.data_mut(|d| d.get_temp(drag_id));
+
             let total_width = ui.available_width();
             let (bar_rect, bar_resp) = ui.allocate_exact_size(
                 egui::vec2(total_width, 4.0),
                 egui::Sense::click_and_drag(),
             );
 
-            if bar_resp.clicked() || bar_resp.dragged() {
+            if bar_resp.dragged() {
                 if let Some(pos) = bar_resp.interact_pointer_pos() {
                     let frac = ((pos.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                    drag_frac = Some(frac);
+                    ui.data_mut(|d| d.insert_temp(drag_id, frac));
+                }
+            } else if bar_resp.clicked() || bar_resp.drag_stopped() {
+                let final_frac = bar_resp
+                    .interact_pointer_pos()
+                    .map(|pos| ((pos.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0))
+                    .or(drag_frac);
+
+                if let Some(frac) = final_frac {
                     let target = Duration::from_secs_f32(frac * total_dur.as_secs_f32());
                     actions.push(Action::Seek(target));
                 }
+                drag_frac = None;
+                ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
+            } else if drag_frac.is_some() {
+                drag_frac = None;
+                ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
             }
+
+            let display_fraction = drag_frac.unwrap_or(fraction);
 
             ui.painter().rect_filled(
                 bar_rect,
@@ -267,16 +287,16 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
             );
             let filled_rect = egui::Rect::from_min_size(
                 bar_rect.min,
-                egui::vec2(bar_rect.width() * fraction, bar_rect.height()),
+                egui::vec2(bar_rect.width() * display_fraction, bar_rect.height()),
             );
             ui.painter().rect_filled(
                 filled_rect,
                 egui::CornerRadius::ZERO,
                 egui::Color32::from_rgb(0xFF, 0x00, 0x00),
             );
-            if bar_resp.hovered() || bar_resp.dragged() {
+            if bar_resp.hovered() || bar_resp.dragged() || drag_frac.is_some() {
                 let circle_center = egui::pos2(
-                    bar_rect.min.x + bar_rect.width() * fraction,
+                    bar_rect.min.x + bar_rect.width() * display_fraction,
                     bar_rect.center().y,
                 );
                 ui.painter().circle_filled(
@@ -302,8 +322,11 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 }
 
                 ui.add_space(8.0);
+                let preview_pos = drag_frac
+                    .map(|f| Duration::from_secs_f32(f * total_dur.as_secs_f32()))
+                    .unwrap_or(cur_pos);
                 let time_str =
-                    format!("{} / {}", format_duration(cur_pos), format_duration(total_dur));
+                    format!("{} / {}", format_duration(preview_pos), format_duration(total_dur));
                 ui.label(
                     egui::RichText::new(time_str)
                         .color(egui::Color32::from_rgb(0xAA, 0xAA, 0xAA))
