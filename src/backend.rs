@@ -355,26 +355,68 @@ fn cookie_path_now(cookies: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathB
 static DOWNLOAD_COOKIE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Paths of this process's live private cookie copies. `prepare` inserts
+/// (sync: runs before the first `.await` that touches them), `cleanup`
+/// removes, and the SignOut handler deletes whatever is still present via
+/// `take_live_download_cookies` — so a sign-out leaves no jar copy on disk
+/// even while a download is running. That download may then fail or continue
+/// unauthenticated; that is acceptable. `std::sync::Mutex` (never held across
+/// `.await`): lock, clone/remove/insert, drop, then do async I/O.
+static LIVE_DOWNLOAD_COOKIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn track_live_download_cookies(path: &Path) {
+    LIVE_DOWNLOAD_COOKIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+fn untrack_live_download_cookies(path: &Path) {
+    LIVE_DOWNLOAD_COOKIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
+
+/// Drain the live set (sync, no `.await` under the lock). Caller deletes the
+/// returned paths with async I/O after the lock is dropped.
+fn take_live_download_cookies() -> Vec<PathBuf> {
+    std::mem::take(
+        &mut *LIVE_DOWNLOAD_COOKIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+    .into_iter()
+    .collect()
+}
+
 /// Copy the canonical jar to a private 0600 file for one download: yt-dlp
 /// rewrites the `--cookies` file when it exits, so it must never see the
-/// canonical path. `None` when signed out or the copy fails (the caller
-/// then downloads without cookies). Runs on the backend runtime, never the
-/// UI thread.
+/// canonical path. `None` when signed out, when the jar holds no cookie
+/// lines (yt-dlp rejects an empty `--cookies` file), or when the copy fails
+/// (the caller then downloads without cookies). Runs on the backend
+/// runtime, never the UI thread.
 async fn prepare_download_cookies(canonical: Option<&Path>) -> Option<PathBuf> {
     let src = canonical?;
     let text = tokio::fs::read_to_string(src).await.ok()?;
+    if !crate::auth::has_cookies(&text) {
+        return None;
+    }
     let tmp = crate::auth::download_cookie_path(
         src,
         std::process::id(),
         DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
     crate::auth::write_cookie_file(&tmp, &text).await.ok()?;
+    track_live_download_cookies(&tmp);
     Some(tmp)
 }
 
 /// Delete a private download copy after the download returns, on every path.
 async fn cleanup_download_cookies(temp: Option<PathBuf>) {
     if let Some(path) = temp {
+        untrack_live_download_cookies(&path);
         let _ = tokio::fs::remove_file(path).await;
     }
 }
@@ -962,6 +1004,15 @@ impl Backend {
                                     let _ = rp.user_auth_remove_cookie().await;
                                 }
                                 *cookies.write().unwrap_or_else(|e| e.into_inner()) = None;
+                                // Delete live private copies even while a
+                                // download is still running (paths drained
+                                // synchronously above; removal is async I/O
+                                // after the lock is dropped). The in-flight
+                                // download may then fail or continue
+                                // unauthenticated; that is acceptable.
+                                for stale in take_live_download_cookies() {
+                                    let _ = tokio::fs::remove_file(stale).await;
+                                }
                                 let _ = event_tx.send(Event::Auth {
                                     signed_in: false,
                                     error: None,
@@ -1069,10 +1120,17 @@ impl Backend {
                                 ctx.request_repaint();
                             }
                             Cmd::Fetch(track) => {
-                                let temp = prepare_download_cookies(
-                                    cookie_path_now(&cookies).as_deref(),
-                                )
-                                .await;
+                                // Skip the private cookie copy entirely when
+                                // the file is already cached: `fetch`
+                                // returns it without spawning yt-dlp.
+                                let temp = if crate::audio::cache_path(&track.id).exists() {
+                                    None
+                                } else {
+                                    prepare_download_cookies(
+                                        cookie_path_now(&cookies).as_deref(),
+                                    )
+                                    .await
+                                };
                                 match crate::audio::fetch(&track.id, temp.as_deref()).await {
                                     Ok(path) => {
                                         let _ = event_tx.send(Event::Ready {
@@ -1093,10 +1151,14 @@ impl Backend {
                             Cmd::Prefetch(track) => {
                                 // Warm the cache for the likely-next track. No
                                 // event on success; failures stay silent.
-                                let temp = prepare_download_cookies(
-                                    cookie_path_now(&cookies).as_deref(),
-                                )
-                                .await;
+                                let temp = if crate::audio::cache_path(&track.id).exists() {
+                                    None
+                                } else {
+                                    prepare_download_cookies(
+                                        cookie_path_now(&cookies).as_deref(),
+                                    )
+                                    .await
+                                };
                                 let _ =
                                     crate::audio::fetch(&track.id, temp.as_deref()).await;
                                 cleanup_download_cookies(temp).await;

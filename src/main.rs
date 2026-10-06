@@ -90,6 +90,27 @@ fn stored_cookie_present() -> bool {
 fn is_private_view(view: &View) -> bool {
     matches!(view, View::Library | View::Playlist(_))
 }
+/// Bookkeeping shared by both `Event::Auth` branches, so a sign-in (like a
+/// sign-out) cannot strand an in-flight page on a spinner: bump the page
+/// generation — results carrying the old generation are dropped by the
+/// `generation != auth_generation` guards — and clear page loading
+/// sets/errors so `ensure_view_loaded` re-requests the open page. Returns
+/// the new generation for the follow-up request. Pure over its arguments
+/// so it is unit-testable without a GUI context.
+fn auth_changed(
+    generation: &mut u64,
+    collections_loading: &mut HashSet<String>,
+    collection_errors: &mut HashMap<String, String>,
+    artists_loading: &mut HashSet<String>,
+    artist_errors: &mut HashMap<String, String>,
+) -> u64 {
+    *generation = generation.wrapping_add(1);
+    collections_loading.clear();
+    collection_errors.clear();
+    artists_loading.clear();
+    artist_errors.clear();
+    *generation
+}
 
 /// How long a radio failure notice stays in the player bar before expiring.
 const RADIO_ERROR_TTL: Duration = Duration::from_secs(5);
@@ -713,26 +734,36 @@ impl eframe::App for App {
                     self.signed_in = signed_in;
                     self.sign_in_busy = false;
                     if signed_in {
-                        self.auth_generation = self.auth_generation.wrapping_add(1);
+                        let generation = auth_changed(
+                            &mut self.auth_generation,
+                            &mut self.collections_loading,
+                            &mut self.collection_errors,
+                            &mut self.artists_loading,
+                            &mut self.artist_errors,
+                        );
                         self.auth_error = None;
                         self.show_sign_in = false;
                         self.library_loading = true;
                         self.library_error = None;
-                        self.backend.send(Cmd::LoadLibrary(self.auth_generation));
+                        self.backend.send(Cmd::LoadLibrary(generation));
+                        let current = self.nav.current.clone();
+                        self.ensure_view_loaded(&current);
                     } else if error.is_none() {
                         // Clean sign-out (not a failed sign-in): drop library
                         // and any cached private pages, then reload the open
                         // public page (if any) instead of leaving it blank.
+                        auth_changed(
+                            &mut self.auth_generation,
+                            &mut self.collections_loading,
+                            &mut self.collection_errors,
+                            &mut self.artists_loading,
+                            &mut self.artist_errors,
+                        );
                         self.auth_error = None;
                         self.library = None;
                         self.library_loading = false;
                         self.library_error = None;
                         self.collections.clear();
-                        self.collections_loading.clear();
-                        self.collection_errors.clear();
-                        self.artists_loading.clear();
-                        self.artist_errors.clear();
-                        self.search_loading.clear();
                         self.search_errors.clear();
                         let current = self.nav.current.clone();
                         self.ensure_view_loaded(&current);
@@ -979,6 +1010,37 @@ mod tests {
         assert!(!is_private_view(&View::Album("a".to_string())));
         assert!(!is_private_view(&View::Artist("r".to_string())));
     }
+    #[test]
+    fn test_auth_changed_drops_old_generation_and_reloads() {
+        // Regression: an auth change in either branch clears in-flight
+        // page state, so the open page is re-requested under the new
+        // generation and a stale result is dropped by the guard instead
+        // of spinning forever.
+        let mut generation = 0u64;
+        let old_generation = generation;
+        let mut collections_loading = HashSet::from(["album1".to_string()]);
+        let mut collection_errors = HashMap::from([("old".to_string(), "e".to_string())]);
+        let mut artists_loading = HashSet::from(["artist1".to_string()]);
+        let mut artist_errors = HashMap::from([("old".to_string(), "e".to_string())]);
+        let new_generation = auth_changed(
+            &mut generation,
+            &mut collections_loading,
+            &mut collection_errors,
+            &mut artists_loading,
+            &mut artist_errors,
+        );
+        assert_eq!(new_generation, old_generation.wrapping_add(1));
+        assert!(collections_loading.is_empty());
+        assert!(collection_errors.is_empty());
+        assert!(artists_loading.is_empty());
+        assert!(artist_errors.is_empty());
+        // Same check the Collection/Artist/PageError handlers run: the
+        // in-flight result (old generation) is rejected, the re-requested
+        // one (new generation) is accepted.
+        assert!(old_generation != generation);
+        assert!(new_generation == generation);
+    }
+
 
     #[test]
     fn test_mpris_command_mapping() {

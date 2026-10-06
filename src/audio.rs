@@ -255,6 +255,7 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
         let args = ytdlp_args(id, &temp_path, cookies);
         let output_res = tokio::process::Command::new("yt-dlp")
             .args(&args)
+            .kill_on_drop(true)
             .output()
             .await;
 
