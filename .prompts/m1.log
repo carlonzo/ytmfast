@@ -1,0 +1,7 @@
+root agent idle; waiting up to 30m0s for 1 background task(s)
+I am fetching and checking the crate dependencies with Cargo. I will proceed once compilation completes.
+I will wait for the dependencies to download and compile.
+I will wait for the build dependencies to finish checking.
+I am running `cargo test` and will report the results when execution completes.
+I will wait for `cargo test` to finish.
+I am running `timeout 10 cargo run` to verify that the application window launches without panicking.

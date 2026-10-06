@@ -1,0 +1,14 @@
+[package]
+name = "ytmfast"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit"] }
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["http", "image", "svg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rustypipe = { version = "0.11.4", features = ["rustls-tls-native-roots", "userdata"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
+directories = "6"

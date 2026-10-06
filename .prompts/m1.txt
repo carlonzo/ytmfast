@@ -1,0 +1,62 @@
+You are implementing MILESTONE 1 ("Core playback") of `ytmfast`, a native YouTube Music desktop client in Rust + egui.
+Work ONLY in /home/carlo/claude-rc/ytmfast (a git repo containing PLAN.md; read it first, it is the spec). Toolchain: Rust 1.98 at /usr/bin/cargo. Linux, Wayland display. yt-dlp at /usr/bin/yt-dlp (works).
+
+Style rule: keep code SMALL. No unrequested abstractions, no traits with one impl, no scaffolding for later milestones. Fewest files. Target total < ~1200 lines.
+
+## Verified facts (do not re-investigate, trust these)
+- rustypipe 0.11.4 (crates.io, features ["rustls-tls-native-roots","userdata"]) works for METADATA only: use `RustyPipe::builder().storage_dir(<data dir>).build()?` then `rp.query().music_search_tracks("daft punk").await` (returns a paginator with `.items: Vec<TrackItem>`; TrackItem has id, name, duration: Option<u32>, cover (Vec<Thumbnail> with url,width,height), artists (Vec<ArtistId> with name), album: Option<AlbumId> with name). Check the real API via `cargo doc` / ~/.cargo/registry sources if a field name differs.
+- rustypipe CANNOT stream. NEVER call rp.player() or anything stream-related.
+- Audio is fetched with yt-dlp: `yt-dlp -q --no-warnings -f 'bestaudio[ext=m4a]' -o <file> https://music.youtube.com/watch?v=<id>` (~4 s for a 6 MB track). If a cookies file is configured, add `--cookies <file>`. NEVER log cookie contents.
+- rodio 0.22 with default-features=false and features ["playback","symphonia-aac","symphonia-isomp4"] decodes that m4a via `rodio::Decoder::try_from(std::fs::File)`, 44.1 kHz stereo, correct total_duration(). Opus/webm is NOT decodable: always request m4a. Look up the exact rodio 0.22 API in ~/.cargo/registry/src after `cargo fetch` (OutputStream / Sink / Player names changed across versions; e.g. `rodio::OutputStreamBuilder::open_default_stream()` and `rodio::Sink::connect_new(stream.mixer())` in 0.21+; verify, do not guess). Sink supports pause/play/set_volume/try_seek/get_pos/empty.
+
+## Dependencies (Cargo.toml, edition 2024, package name ytmfast)
+- eframe 0.36, default-features = false, features ["glow","wayland","x11","default_fonts","persistence","accesskit"]
+- egui_extras 0.36 features ["http","image","svg"] + image (default-features=false, features ["jpeg","png","webp"]) so thumbnails load from URLs with `egui::Image::from_uri(url)`; call `egui_extras::install_image_loaders(&cc.egui_ctx)`.
+- rustypipe 0.11.4 as above
+- tokio (features rt-multi-thread, macros, process, fs, time)
+- rodio 0.22 as above
+- directories (for ~/.cache/ytmfast and data/config dirs)
+- rand (for shuffle) only if needed; a tiny xorshift seeded from time is also fine.
+- Optional: fastframe-icons and fastframe-fonts from git = "https://github.com/crmne/fastframe", tag = "v0.4.1". If they fail to build or their API is unclear after ONE attempt, drop them and use plain egui text/unicode glyphs (e.g. "⏮" "▶" "⏸" "⏭"). Do not spend more than one attempt. Do NOT add fastframe-now-playing (milestone 2).
+- No other deps unless strictly needed.
+
+## File layout (exactly these source files)
+- src/main.rs: eframe setup (window title "ytmfast", ~1200x800), image loaders, App struct holding UI state + backend handle; poll events each frame (try_recv loop); draw UI; views push `Action`s into a Vec during drawing and the App applies them AFTER drawing.
+- src/backend.rs: spawns a std::thread that owns a tokio multi-thread runtime. `Cmd` enum in (std::sync::mpsc::Sender<Cmd>), `Event` enum out (std::sync::mpsc + `egui::Context::request_repaint()` after every send). Wraps rustypipe. Maps rustypipe types to an own small `Track { id, title, artist, album, duration_secs: u32, thumb_url: Option<String> }` so the UI never touches rustypipe types. Cmds for M1: Search(String), Fetch(Track) (download audio via audio.rs fetch). Events: SearchResults{query, tracks} / SearchError(String), Ready{id, path} / FetchError{id, msg}. Each Cmd is handled in a spawned tokio task so a slow download never blocks a search. Ignore stale results (search results whose query != current query; Ready for an id that is no longer the current track should not start playback).
+- src/audio.rs:
+  * `fn cache_path(id) -> PathBuf` = ~/.cache/ytmfast/audio/<id>.m4a (create dir).
+  * `fn ytdlp_args(id: &str, out: &Path, cookies: Option<&Path>) -> Vec<String>` (pure, unit-tested).
+  * `async fn fetch(id, cookies) -> Result<PathBuf, String>`: if cache file exists return it; else run yt-dlp (tokio::process::Command) writing to `<id>.m4a.part` ... NOTE yt-dlp appends its own extensions/handles .part itself, so pass `-o <dir>/<id>.dl.m4a`-style explicit output and then rename to the final path only after success; ensure the final name never exists in a half-written state; validate the id is [A-Za-z0-9_-]{11} before building the path/command. Capture stderr for the error message (truncate).
+  * `Player`: owns the rodio output stream + Sink (lives on the UI thread; rodio ops are non-blocking; opening/decoding a local file is fine on UI thread but prefer opening the decoder... acceptable either way since the file is local and already fully downloaded). Methods: play_file(path) (stop previous, append decoder, play), toggle_pause, seek(Duration), position(), duration (from decoder total_duration, fall back to Track.duration_secs), set_volume(f32), is_finished().
+  * `Queue { tracks: Vec<Track>, order: Vec<usize>, pos: usize, shuffle: bool, repeat: Repeat{Off,All,One} }` with pure methods: new(tracks, start_index), current(), next() -> Option<&Track> (auto-advance semantics: repeat One returns same track for auto-advance; a user "next" press skips even in repeat One — expose `next(user: bool)` or two methods), prev() (if position > 3 s restart the track instead — that check belongs in the App, queue prev just goes back; at index 0 with repeat Off stays at 0), jump(index), set_shuffle(bool) (keeps current track current, shuffles the rest), cycle_repeat(). End of list with repeat Off -> None (playback stops); repeat All wraps.
+- src/ui.rs: theme + views for M1 only.
+
+## UI (dark, YouTube Music colors)
+- Colors: background #030303, cards/hover #212121, player bar #212121, primary text #FFFFFF, secondary #AAAAAA, accent red #FF0000 (progress bar). Set egui Visuals dark with these colors (panel_fill, window_fill, extreme_bg_color, selection, hover widget bg).
+- Top bar (TopBottomPanel, ~64px): red "Music" logo text left; pill search box (#212121, rounded 8, ~480px, hint "Search songs"). Enter triggers Search. Show a spinner while searching.
+- Central: results list (ScrollArea, show_rows or similar), each row: 40px thumbnail (egui::Image::from_uri, rounded), title (white), "artist • album" (grey), duration right-aligned (m:ss). Hover highlights #212121. Clicking a row => Action::PlayFrom(index): queue = the whole current result list, starting at that index. Highlight the currently playing row (red title or icon).
+- Bottom player bar (~72px, #212121): a thin red progress line across the full top edge that is draggable/clickable to seek; left: prev / play-pause (bigger) / next buttons + time "1:23 / 3:45"; center: thumb 40px + title + "artist • album"; right: volume slider (0..1), shuffle toggle, repeat cycle button (Off/All/One visual). While the current track is downloading show "Loading…" (optimistic: the clicked track appears in the player bar immediately).
+- Request repaint ~every 250 ms while playing (ctx.request_repaint_after) so time/progress update and auto-advance happens; when the sink finishes (empty) and a track was playing, advance via queue (auto-advance) and send Fetch for the next track.
+- Keyboard: Space toggles play/pause when the search box does not have focus.
+- Errors (search/fetch) shown as a small red label, not panics.
+
+## Hard rules
+- The UI thread must NEVER block on network or subprocesses: rustypipe calls and yt-dlp only run on the backend tokio runtime.
+- No unwrap() on fallible runtime paths (network, IO, audio device). If no audio device is available, show an error but don't crash.
+- No stream/player calls on rustypipe.
+- Never log or print cookie contents.
+- Don't implement milestone 2/3 features (sidebar, home shelves, album/artist pages, queue panel, MPRIS, auth dialog, prefetch, persistence). A `cookies: Option<PathBuf>` field passed through to ytdlp_args is enough (None in M1).
+
+## Tests to write
+- audio.rs unit tests for Queue: next/prev/end of list with repeat Off/All/One, user-next in repeat One, jump, shuffle keeps current track and is a permutation, toggling shuffle off restores original order position.
+- ytdlp_args test with and without cookies (assert exact arg vectors incl. `--cookies <path>` present/absent, the -f 'bestaudio[ext=m4a]' format, and the music.youtube.com URL).
+- id validation test.
+- One `#[ignore]` network smoke test (in tests/ or in a #[cfg(test)] module): search "daft punk" via rustypipe returns >0 tracks; fetch the first track's id with audio::fetch into the cache; decode the file with rodio::Decoder and assert total_duration() > 60 s. (Use #[tokio::test] or build a runtime manually.)
+
+## Acceptance (do all, iterate until clean)
+1. `cargo build` with zero warnings.
+2. `cargo test` passes.
+3. `cargo test -- --ignored` passes (network is available).
+4. `timeout 10 cargo run` starts the window without panicking (exit code 124 from timeout is expected).
+5. Add a `.gitignore` with `/target`. Then `git add -A && git commit -m "Milestone 1: core playback"` (do NOT commit target/). Do not push.
+At the end print a short summary: files + line counts (`wc -l src/*.rs`), test output summary, and any deviations from this spec.
