@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -75,6 +77,20 @@ pub struct SearchAll {
     pub artists: Vec<Card>,
     pub playlists: Vec<Card>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    pub history: Vec<Track>,
+    pub playlists: Vec<Card>,
+    pub albums: Vec<Card>,
+    pub artists: Vec<Card>,
+    pub liked: Vec<Track>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SignInSource {
+    Browser(String),
+    File(PathBuf),
+}
 
 pub enum Cmd {
     LoadHome,
@@ -85,6 +101,9 @@ pub enum Cmd {
     Radio(String),
     Fetch(Track),
     Prefetch(Track),
+    SignIn(SignInSource),
+    SignOut,
+    LoadLibrary(u64),
 }
 
 pub enum Event {
@@ -103,6 +122,9 @@ pub enum Event {
     },
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
+    Auth { signed_in: bool, error: Option<String> },
+    Library { generation: u64, library: Library },
+    LibraryError { generation: u64, error: String },
 }
 
 pub fn select_thumbnail_min(covers: &[rustypipe::model::Thumbnail], min_width: u32) -> Option<String> {
@@ -324,6 +346,54 @@ pub struct Backend {
     rx: mpsc::Receiver<Event>,
 }
 
+fn cookie_path_now(cookies: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathBuf> {
+    cookies.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Re-remove the cookie file when signed out now: a yt-dlp download started
+/// with `--cookies` rewrites it when it exits, so a download still running
+/// at sign-out re-creates the file. Call only after a download that was
+/// actually given a cookie path. The lock is dropped before the fs call;
+/// errors ignored.
+async fn scrub_recreated_cookies(
+    cookies: &std::sync::RwLock<Option<PathBuf>>,
+    cookie_file: Option<&Path>,
+) {
+    if cookie_path_now(cookies).is_none()
+        && let Some(path) = cookie_file
+    {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+
+/// Key page loads on rustypipe's own auth state, not on the file on disk.
+fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::RustyPipeQuery {
+    let q = rp.query();
+    if q.auth_enabled(rustypipe::client::ClientType::DesktopMusic) {
+        q.authenticated()
+    } else {
+        q
+    }
+}
+
+async fn fail_auth(
+    event_tx: &mpsc::Sender<Event>,
+    ctx: &egui::Context,
+    rp: Option<&Arc<rustypipe::client::RustyPipe>>,
+    cookies: &std::sync::RwLock<Option<PathBuf>>,
+    cookie_file: &Path,
+    error: String,
+) {
+    let _ = tokio::fs::remove_file(cookie_file).await;
+    if let Some(rp) = rp {
+        let _ = rp.user_auth_remove_cookie().await;
+    }
+    *cookies.write().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = event_tx.send(Event::Auth { signed_in: false, error: Some(error) });
+    ctx.request_repaint();
+}
+
 impl Backend {
     pub fn new(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -350,7 +420,37 @@ impl Backend {
                 Ok(rp) => (Some(Arc::new(rp)), None),
                 Err(e) => (None, Some(format!("RustyPipe init error: {e}"))),
             };
-
+            let cookies: std::sync::Arc<std::sync::RwLock<Option<PathBuf>>> =
+                std::sync::Arc::new(std::sync::RwLock::new(None));
+            let cookie_file: Option<PathBuf> = crate::auth::cookie_path();
+            // Signed in only when the cookie file is a regular file AND
+            // rustypipe actually holds a cookie (a yt-dlp download still
+            // running at sign-out rewrites the file when it exits, so the
+            // file alone is not trustworthy). Otherwise delete and start out.
+            if let Some(path) = &cookie_file {
+                let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+                let authed = rp.as_ref().is_some_and(|rp| {
+                    rp.query().auth_enabled(rustypipe::client::ClientType::DesktopMusic)
+                });
+                if regular && authed {
+                    let _ =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    *cookies.write().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+                    let _ = event_tx.send(Event::Auth { signed_in: true, error: None });
+                } else {
+                    let _ = std::fs::remove_file(path);
+                    // File missing or rustypipe holds nothing useful: drop any
+                    // stale account cookie so authed page requests cannot
+                    // leak it. Runs on the backend thread before the loop.
+                    if let (Some(rt), Some(rp)) = (rt.as_ref(), rp.as_ref()) {
+                        let _ = rt.block_on(rp.user_auth_remove_cookie());
+                    }
+                }
+            } else if let (Some(rt), Some(rp)) = (rt.as_ref(), rp.as_ref()) {
+                // No config dir: rustypipe may still hold an account cookie
+                // from its storage dir, so drop it and start signed out.
+                let _ = rt.block_on(rp.user_auth_remove_cookie());
+            }
             let _guard = rt.as_ref().map(|r| r.enter());
             while let Ok(cmd) = cmd_rx.recv() {
                 let event_tx = event_tx.clone();
@@ -359,6 +459,8 @@ impl Backend {
                 let rp_err = rp_err.clone();
                 let rt_err = rt_err.clone();
 
+                let cookies = cookies.clone();
+                let cookie_file = cookie_file.clone();
                 if let Some(rt_ref) = &rt {
                     rt_ref.spawn(async move {
                         match cmd {
@@ -502,7 +604,8 @@ impl Backend {
                             }
                             Cmd::OpenAlbum(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_album(&id).await {
+                                    let q = authed_query(&rp);
+                                    match q.music_album(&id).await {
                                         Ok(album) => {
                                             let total_secs: u32 = album
                                                 .tracks
@@ -558,7 +661,8 @@ impl Backend {
                             }
                             Cmd::OpenPlaylist(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_playlist(&id).await {
+                                    let q = authed_query(&rp);
+                                    match q.music_playlist(&id).await {
                                         Ok(playlist) => {
                                             let total_secs: u32 = playlist
                                                 .tracks
@@ -616,7 +720,8 @@ impl Backend {
                             }
                             Cmd::OpenArtist(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_artist(&id, false).await {
+                                    let q = authed_query(&rp);
+                                    match q.music_artist(&id, false).await {
                                         Ok(artist) => {
                                             let thumb_url =
                                                 select_thumbnail_largest(&artist.header_image);
@@ -683,8 +788,256 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
+                            Cmd::SignIn(source) => {
+                                let result: Result<(), String> = async {
+                                    let rp_ref = rp.as_ref().ok_or_else(|| {
+                                        rp_err
+                                            .clone()
+                                            .unwrap_or_else(|| "RustyPipe init failed".to_string())
+                                    })?;
+                                    let cookie_file = cookie_file.as_ref().ok_or_else(|| {
+                                        "No config dir: cannot store cookies".to_string()
+                                    })?;
+                                    // Each arm returns the raw jar text; filtering,
+                                    // the cookie check, and the 0600 write below
+                                    // happen ONCE in shared code.
+                                    let (raw, import_stderr) = match source {
+                                        SignInSource::Browser(browser) => {
+                                            let args =
+                                                crate::auth::import_args(&browser, cookie_file)
+                                                    .ok_or_else(|| {
+                                                        format!("Unsupported browser: {browser}")
+                                                    })?;
+                                            // 0600 placeholder BEFORE content lands.
+                                            crate::auth::write_cookie_file(
+                                                cookie_file,
+                                                crate::auth::COOKIE_FILE_HEADER,
+                                            )
+                                            .await?;
+                                            let out = tokio::time::timeout(
+                                                Duration::from_secs(60),
+                                                tokio::process::Command::new("yt-dlp")
+                                                    .args(&args)
+                                                    .kill_on_drop(true)
+                                                    .output(),
+                                            )
+                                            .await
+                                            .map_err(|_| {
+                                                "Browser import timed out".to_string()
+                                            })?
+                                            .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+                                            let stderr =
+                                                String::from_utf8_lossy(&out.stderr).into_owned();
+                                            // yt-dlp exits 1 on the probe URL ("Unsupported
+                                            // URL") but still saves the jar on close: do NOT
+                                            // gate on exit status. Only the file counts.
+                                            let raw =
+                                                tokio::fs::read_to_string(cookie_file).await.map_err(
+                                                    |_| {
+                                                        format!(
+                                                            "Browser import failed: {}",
+                                                            crate::auth::short_error(&stderr)
+                                                        )
+                                                    },
+                                                )?;
+                                            (raw, Some(stderr))
+                                        }
+                                        SignInSource::File(path) => {
+                                            let src = tokio::task::spawn_blocking(move || {
+                                                crate::auth::resolve_user_cookie_file(
+                                                    &path.to_string_lossy(),
+                                                )
+                                            })
+                                            .await
+                                            .map_err(|e| {
+                                                format!("Cookie check task failed: {e}")
+                                            })??;
+                                            let raw = tokio::fs::read_to_string(&src)
+                                                .await
+                                                .map_err(|e| {
+                                                    format!("Cannot read cookie file: {e}")
+                                                })?;
+                                            (raw, None)
+                                        }
+                                    };
+                                    // Drop every non-youtube/google cookie, and feed the
+                                    // FILTERED text. Skip the pointless write+remove
+                                    // when the jar holds no cookies at all.
+                                    let filtered = crate::auth::filter_cookies(&raw);
+                                    if !crate::auth::has_cookies(&filtered) {
+                                        match import_stderr.as_deref() {
+                                            Some(stderr) => {
+                                                return Err(format!(
+                                                    "Browser import failed: {}",
+                                                    crate::auth::short_error(stderr)
+                                                ));
+                                            }
+                                            None => return Err("No cookies found".to_string()),
+                                        }
+                                    }
+                                    crate::auth::write_cookie_file(cookie_file, &filtered).await?;
+                                    rp_ref
+                                        .user_auth_set_cookie_txt(&filtered)
+                                        .await
+                                        .map_err(|e| format!("Invalid cookies: {e}"))?;
+                                    rp_ref
+                                        .user_auth_check_cookie()
+                                        .await
+                                        .map_err(|e| format!("Cookie check failed: {e}"))?;
+                                    Ok(())
+                                }
+                                .await;
+                                match result {
+                                    Ok(()) => {
+                                        if let Some(cookie_file) = &cookie_file {
+                                            *cookies.write().unwrap_or_else(|e| e.into_inner()) =
+                                                Some(cookie_file.clone());
+                                        }
+                                        let _ = event_tx.send(Event::Auth {
+                                            signed_in: true,
+                                            error: None,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        if let Some(cookie_file) = &cookie_file {
+                                            fail_auth(
+                                                &event_tx,
+                                                &ctx,
+                                                rp.as_ref(),
+                                                &cookies,
+                                                cookie_file,
+                                                error,
+                                            )
+                                            .await;
+                                        } else {
+                                            let _ = event_tx.send(Event::Auth {
+                                                signed_in: false,
+                                                error: Some(error),
+                                            });
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::SignOut => {
+                                if let Some(cookie_file) = &cookie_file {
+                                    let _ = tokio::fs::remove_file(cookie_file).await;
+                                }
+                                if let Some(rp) = &rp {
+                                    let _ = rp.user_auth_remove_cookie().await;
+                                }
+                                *cookies.write().unwrap_or_else(|e| e.into_inner()) = None;
+                                let _ = event_tx.send(Event::Auth {
+                                    signed_in: false,
+                                    error: None,
+                                });
+                                ctx.request_repaint();
+                            }
+                            Cmd::LoadLibrary(generation) => {
+                                if let Some(rp) = rp {
+                                    let q = rp.query();
+                                    let (
+                                        history_res,
+                                        playlists_res,
+                                        albums_res,
+                                        artists_res,
+                                        liked_res,
+                                    ) = tokio::join!(
+                                        q.music_history(),
+                                        q.music_saved_playlists(),
+                                        q.music_saved_albums(),
+                                        q.music_saved_artists(),
+                                        q.music_liked_tracks(),
+                                    );
+                                    let mut failures = 0;
+                                    let history = match history_res {
+                                        Ok(p) => crate::auth::dedupe_history(
+                                            p.items
+                                                .into_iter()
+                                                .map(|h| track_from(h.item))
+                                                .collect(),
+                                        ),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let playlists = match playlists_res {
+                                        Ok(p) => {
+                                            p.items.into_iter().map(playlist_card).collect()
+                                        }
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let albums = match albums_res {
+                                        Ok(p) => p.items.into_iter().map(album_card).collect(),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let artists = match artists_res {
+                                        Ok(p) => p.items.into_iter().map(artist_card).collect(),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let (liked_id, liked) = match liked_res {
+                                        Ok(pl) => (
+                                            Some(pl.id),
+                                            pl.tracks
+                                                .items
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect(),
+                                        ),
+                                        Err(_) => {
+                                            failures += 1;
+                                            (None, Vec::new())
+                                        }
+                                    };
+                                    if failures == 5 {
+                                        let _ = event_tx.send(Event::LibraryError {
+                                            generation,
+                                            error: "Failed to load library".to_string(),
+                                        });
+                                    } else {
+                                        let playlists = match liked_id {
+                                            Some(id) => {
+                                                crate::auth::with_liked_first(playlists, &id)
+                                            }
+                                            None => playlists,
+                                        };
+                                        let _ = event_tx.send(Event::Library {
+                                            generation,
+                                            library: Library {
+                                                history,
+                                                playlists,
+                                                albums,
+                                                artists,
+                                                liked,
+                                            },
+                                        });
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::LibraryError {
+                                        generation,
+                                        error: err,
+                                    });
+                                }
+                                ctx.request_repaint();
+                            }
                             Cmd::Fetch(track) => {
-                                match crate::audio::fetch(&track.id, None).await {
+                                let cookies_now = cookie_path_now(&cookies);
+                                let used_cookies = cookies_now.is_some();
+                                match crate::audio::fetch(&track.id, cookies_now.as_deref()).await {
                                     Ok(path) => {
                                         let _ = event_tx.send(Event::Ready {
                                             id: track.id,
@@ -698,12 +1051,20 @@ impl Backend {
                                         });
                                     }
                                 }
+                                if used_cookies {
+                                    scrub_recreated_cookies(&cookies, cookie_file.as_deref()).await;
+                                }
                                 ctx.request_repaint();
                             }
                             Cmd::Prefetch(track) => {
                                 // Warm the cache for the likely-next track. No
                                 // event on success; failures stay silent.
-                                let _ = crate::audio::fetch(&track.id, None).await;
+                                let cookies_now = cookie_path_now(&cookies);
+                                let used_cookies = cookies_now.is_some();
+                                let _ = crate::audio::fetch(&track.id, cookies_now.as_deref()).await;
+                                if used_cookies {
+                                    scrub_recreated_cookies(&cookies, cookie_file.as_deref()).await;
+                                }
                                 ctx.request_repaint();
                             }
                         }
@@ -730,6 +1091,24 @@ impl Backend {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
                         }
                         Cmd::Prefetch(_) => {}
+                        Cmd::SignIn(_) => {
+                            let _ = event_tx.send(Event::Auth {
+                                signed_in: false,
+                                error: Some(err),
+                            });
+                        }
+                        Cmd::SignOut => {
+                            let _ = event_tx.send(Event::Auth {
+                                signed_in: false,
+                                error: None,
+                            });
+                        }
+                        Cmd::LoadLibrary(generation) => {
+                            let _ = event_tx.send(Event::LibraryError {
+                                generation,
+                                error: err,
+                            });
+                        }
                     }
                     ctx.request_repaint();
                 }

@@ -1,9 +1,13 @@
 mod audio;
+mod auth;
 mod backend;
 mod ui;
 
 use audio::{Player, Queue};
-use backend::{ArtistPage, Backend, Cmd, Collection, Event, Home, PageKind, SearchAll, Track};
+use backend::{
+    ArtistPage, Backend, Cmd, Collection, Event, Home, Library, PageKind, SearchAll, SignInSource,
+    Track,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
@@ -59,9 +63,27 @@ impl Settings {
         app.queue.shuffle = self.shuffle;
         app.queue.repeat = self.repeat;
         app.queue_open = self.queue_open;
-        app.nav = Nav::new(Self::sanitize_view(self.last_view.clone()));
+        // Signed-in state comes from disk + rustypipe, not Settings: a
+        // restored private view while signed out would show a broken page.
+        let mut view = Self::sanitize_view(self.last_view.clone());
+        let private = matches!(
+            view,
+            View::Library | View::Playlist(_) | View::Album(_) | View::Artist(_)
+        );
+        if private && !stored_cookie_present() {
+            view = View::Home;
+        }
+        app.nav = Nav::new(view);
         app.ensure_view_loaded(&app.nav.current.clone());
     }
+}
+
+/// True when a cookie jar file exists on disk, i.e. a sign-in (and the
+/// private views it unlocks) is likely forthcoming via `Event::Auth`.
+fn stored_cookie_present() -> bool {
+    crate::auth::cookie_path().is_some_and(|p| {
+        std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
+    })
 }
 
 /// How long a radio failure notice stays in the player bar before expiring.
@@ -176,6 +198,28 @@ pub struct App {
     pub artists: HashMap<String, ArtistPage>,
     pub artists_loading: HashSet<String>,
     pub artist_errors: HashMap<String, String>,
+
+    // Auth + library (M3). Signed-in state comes from the cookie file on disk.
+    pub signed_in: bool,
+    pub auth_error: Option<String>,
+    pub show_sign_in: bool,
+    pub sign_in_busy: bool,
+    pub sign_in_browser: String,
+    pub sign_in_file: String,
+    pub show_user_menu: bool,
+    pub auth_generation: u64,
+    pub library: Option<Library>,
+    pub library_loading: bool,
+    pub library_error: Option<String>,
+    pub library_chip: LibraryChip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryChip {
+    Playlists,
+    Songs,
+    Albums,
+    Artists,
 }
 
 impl App {
@@ -213,6 +257,18 @@ impl App {
             artists: HashMap::new(),
             artists_loading: HashSet::new(),
             artist_errors: HashMap::new(),
+            signed_in: false,
+            auth_error: None,
+            show_sign_in: false,
+            sign_in_busy: false,
+            sign_in_browser: "firefox".to_string(),
+            sign_in_file: String::new(),
+            show_user_menu: false,
+            auth_generation: 0,
+            library: None,
+            library_loading: false,
+            library_error: None,
+            library_chip: LibraryChip::Playlists,
         }
     }
 
@@ -221,7 +277,7 @@ impl App {
         self.is_active_playback = true;
         self.is_loading = true;
         self.fetch_error = None;
-        self.prefetched = None;
+        self.radio_error = None;
         self.last_start = Some(LastStart {
             track_id: track.id.clone(),
             list_len: self.queue.tracks.len(),
@@ -278,7 +334,13 @@ impl App {
                     self.backend.send(Cmd::LoadHome);
                 }
             }
-            View::Library => {}
+            View::Library => {
+                if self.signed_in && self.library.is_none() && !self.library_loading {
+                    self.library_loading = true;
+                    self.library_error = None;
+                    self.backend.send(Cmd::LoadLibrary(self.auth_generation));
+                }
+            }
             View::Search(q) => {
                 if !self.search_results.contains_key(q) && !self.search_loading.contains(q) {
                     self.search_loading.insert(q.clone());
@@ -454,6 +516,48 @@ impl App {
             Action::ToggleSidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
             }
+            Action::ShowSignIn => {
+                self.show_sign_in = true;
+                self.show_user_menu = false;
+            }
+            Action::HideSignIn => {
+                // A sign-in may still be running on the backend; keep
+                // `sign_in_busy` so the buttons stay disabled and no second
+                // import can start. Only `Event::Auth` clears it.
+                self.show_sign_in = false;
+                if !self.sign_in_busy {
+                    self.auth_error = None;
+                }
+            }
+            Action::SignInBrowser(browser) => {
+                self.sign_in_busy = true;
+                self.auth_error = None;
+                self.backend.send(Cmd::SignIn(SignInSource::Browser(browser)));
+            }
+            Action::SignInFile(path) => {
+                self.sign_in_busy = true;
+                self.auth_error = None;
+                self.backend.send(Cmd::SignIn(SignInSource::File(path.into())));
+            }
+            Action::SignOut => {
+                self.show_user_menu = false;
+                self.auth_generation = self.auth_generation.wrapping_add(1);
+                // Leave private pages so the view is not blank after sign-out.
+                match &self.nav.current {
+                    View::Playlist(_) | View::Album(_) | View::Artist(_) | View::Library => {
+                        self.nav.go(View::Home);
+                        self.ensure_view_loaded(&View::Home);
+                    }
+                    _ => {}
+                }
+                self.backend.send(Cmd::SignOut);
+            }
+            Action::ToggleUserMenu => {
+                self.show_user_menu = !self.show_user_menu;
+            }
+            Action::SetLibraryChip(chip) => {
+                self.library_chip = chip;
+            }
             Action::Radio(video_id) => {
                 if self.radio_pending.as_deref() == Some(video_id.as_str()) {
                     return;
@@ -488,7 +592,11 @@ impl App {
                     self.artists_loading.insert(id.clone());
                     self.backend.send(Cmd::OpenArtist(id));
                 }
-                View::Library => {}
+                View::Library => {
+                    self.library_error = None;
+                    self.library_loading = true;
+                    self.backend.send(Cmd::LoadLibrary(self.auth_generation));
+                }
             },
         }
     }
@@ -588,6 +696,44 @@ impl eframe::App for App {
                         self.fetch_error = Some(msg);
                     }
                 }
+                Event::Auth { signed_in, error } => {
+                    self.signed_in = signed_in;
+                    self.sign_in_busy = false;
+                    if signed_in {
+                        self.auth_generation = self.auth_generation.wrapping_add(1);
+                        self.auth_error = None;
+                        self.show_sign_in = false;
+                        self.library_loading = true;
+                        self.library_error = None;
+                        self.backend.send(Cmd::LoadLibrary(self.auth_generation));
+                    } else if error.is_none() {
+                        // Clean sign-out (not a failed sign-in): drop library
+                        // and any cached private pages.
+                        self.auth_error = None;
+                        self.library = None;
+                        self.library_loading = false;
+                        self.library_error = None;
+                        self.collections.clear();
+                        self.collection_errors.clear();
+                    } else {
+                        self.auth_error = error;
+                    }
+                }
+                Event::Library { generation, library } => {
+                    if !self.signed_in || generation != self.auth_generation {
+                        continue;
+                    }
+                    self.library_loading = false;
+                    self.library_error = None;
+                    self.library = Some(library);
+                }
+                Event::LibraryError { generation, error } => {
+                    if !self.signed_in || generation != self.auth_generation {
+                        continue;
+                    }
+                    self.library_loading = false;
+                    self.library_error = Some(error);
+                }
             }
         }
 
@@ -647,6 +793,7 @@ impl eframe::App for App {
             ui::draw_queue_panel(ui, self, &mut actions);
         }
         ui::draw_central_panel(ui, self, &mut actions);
+        ui::draw_sign_in_dialog(ui, self, &mut actions);
 
         // Apply actions (Raise/Quit need the viewport, so handle inline)
         let mut viewport_cmds = Vec::new();

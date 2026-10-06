@@ -1,3 +1,4 @@
+pub mod library;
 pub mod pages;
 
 use std::time::Duration;
@@ -5,6 +6,7 @@ use crate::audio::Repeat;
 use crate::backend::{Card, CardKind, Track};
 use crate::App;
 
+pub use library::*;
 pub use pages::*;
 
 pub const COLOR_BG: egui::Color32 = egui::Color32::from_rgb(0x03, 0x03, 0x03);
@@ -188,6 +190,13 @@ pub enum Action {
     ToggleSidebar,
     Radio(String),
     Retry(View),
+    ShowSignIn,
+    HideSignIn,
+    SignInBrowser(String),
+    SignInFile(String),
+    SignOut,
+    ToggleUserMenu,
+    SetLibraryChip(crate::LibraryChip),
 }
 
 pub fn format_duration(d: Duration) -> String {
@@ -334,18 +343,57 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                     }
                 }
 
-                // Right aligned Sign in button placeholder
+                // Right aligned Sign in / avatar button
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
-                    let sign_in_btn = egui::Button::image_and_text(
-                        Icon::User.image(COLOR_TEXT_SECONDARY, 16.0),
-                        egui::RichText::new("Sign in")
-                            .color(COLOR_TEXT_SECONDARY)
-                            .size(13.0),
-                    )
-                    .fill(COLOR_SURFACE)
-                    .corner_radius(16);
-                    let _ = ui.add_enabled(false, sign_in_btn);
+                    if app.signed_in {
+                        let avatar = egui::Button::image(
+                            Icon::User.image(COLOR_TEXT_PRIMARY, 16.0),
+                        )
+                        .fill(COLOR_SURFACE)
+                        .corner_radius(16);
+                        let avatar_resp = ui.add(avatar);
+                        let avatar_clicked = avatar_resp.clicked();
+                        if avatar_clicked {
+                            actions.push(Action::ToggleUserMenu);
+                        }
+                        if app.show_user_menu && !avatar_clicked {
+                            let menu_resp = egui::Area::new(egui::Id::new("user_menu"))
+                                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 56.0))
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::new()
+                                        .fill(COLOR_SURFACE)
+                                        .corner_radius(8)
+                                        .inner_margin(egui::Margin::same(8))
+                                        .show(ui, |ui| {
+                                            if ui.button("Sign out").clicked() {
+                                                actions.push(Action::SignOut);
+                                            }
+                                        });
+                                });
+                            let press_origin =
+                                ui.input(|i| i.pointer.press_origin().unwrap_or_default());
+                            let clicked_outside = ui.input(|i| i.pointer.any_pressed())
+                                && !menu_resp.response.rect.contains(press_origin)
+                                && !avatar_resp.rect.contains(press_origin);
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) || clicked_outside
+                            {
+                                actions.push(Action::ToggleUserMenu);
+                            }
+                        }
+                    } else {
+                        let sign_in_btn = egui::Button::image_and_text(
+                            Icon::User.image(COLOR_TEXT_SECONDARY, 16.0),
+                            egui::RichText::new("Sign in")
+                                .color(COLOR_TEXT_SECONDARY)
+                                .size(13.0),
+                        )
+                        .fill(COLOR_SURFACE)
+                        .corner_radius(16);
+                        if ui.add(sign_in_btn).clicked() {
+                            actions.push(Action::ShowSignIn);
+                        }
+                    }
                 });
             });
         });
@@ -487,12 +535,65 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                 .corner_radius(16);
                 let _ = ui.add_enabled(false, new_playlist_btn);
 
-                ui.add_space(20.0);
-                ui.label(
-                    egui::RichText::new("Sign in to see your playlists")
-                        .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
-                        .size(12.0),
-                );
+                ui.add_space(12.0);
+                if app.signed_in {
+                    if let Some(lib) = &app.library {
+                        egui::ScrollArea::vertical()
+                            .id_salt("sidebar_playlists")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for pl in &lib.playlists {
+                                    let is_active = matches!(&app.nav.current, View::Playlist(id) if *id == pl.id);
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(width - 20.0, 32.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() || is_active {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            egui::CornerRadius::same(6),
+                                            COLOR_SURFACE,
+                                        );
+                                    }
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(rect),
+                                        |ui| {
+                                            ui.horizontal_centered(|ui| {
+                                                ui.add_space(12.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&pl.title)
+                                                            .color(if is_active {
+                                                                COLOR_TEXT_PRIMARY
+                                                            } else {
+                                                                COLOR_TEXT_SECONDARY
+                                                            })
+                                                            .size(13.0),
+                                                    )
+                                                    .truncate()
+                                                    .selectable(false),
+                                                );
+                                            });
+                                        },
+                                    );
+                                    if resp.clicked() {
+                                        actions.push(Action::Navigate(View::Playlist(
+                                            pl.id.clone(),
+                                        )));
+                                    }
+                                }
+                            });
+                    } else if app.library_loading {
+                        ui.spinner();
+                    }
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Sign in to see your playlists")
+                            .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
+                            .size(12.0),
+                    );
+                }
             } else {
                 let plus_btn = egui::Button::image(
                     Icon::Plus.image(egui::Color32::from_rgb(0x77, 0x77, 0x77), 16.0),
@@ -824,21 +925,26 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
 
             let row_h = 56.0;
             // Scroll the current row into view only when the current track
-            // changes, not every frame. Key on (pos, track id): a NEW queue
-            // starting at the same position must still scroll. `show_rows`
-            // virtualizes rows, so a far-away current row has no widget to
-            // `scroll_to_me` — jump via an explicit scroll offset instead.
-            let current_id = app.queue.current().map(|t| t.id.as_str());
-            let seen_key = (current_pos, current_id);
-            let seen: Option<(usize, Option<String>)> =
+            // changes, not every frame. Key on (pos, hashed track id): a NEW
+            // queue starting at the same position must still scroll, and the
+            // hash avoids a per-frame String clone. `show_rows` virtualizes
+            // rows, so a far-away current row has no widget to `scroll_to_me`
+            // — jump via an explicit scroll offset instead.
+            let seen_key = (
+                current_pos,
+                app.queue.current().map(|t| {
+                    use std::hash::{DefaultHasher, Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    t.id.hash(&mut h);
+                    h.finish()
+                }),
+            );
+            let seen: Option<(usize, Option<u64>)> =
                 ui.data_mut(|d| d.get_temp(ui.id().with("queue_seen")));
-            let scroll_to_current = seen.as_ref().map(|(p, id)| (*p, id.as_deref())) != Some(seen_key);
+            let scroll_to_current = seen != Some(seen_key);
             if scroll_to_current {
                 ui.data_mut(|d| {
-                    d.insert_temp(
-                        ui.id().with("queue_seen"),
-                        (current_pos, current_id.map(str::to_string)),
-                    );
+                    d.insert_temp(ui.id().with("queue_seen"), seen_key);
                 });
             }
             let spacing_y = ui.spacing().item_spacing.y;
@@ -866,80 +972,101 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                                 COLOR_SURFACE,
                             );
                         }
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_space(4.0);
-                                if let Some(url) = &track.thumb_url {
-                                    ui.add(
-                                        egui::Image::from_uri(url)
-                                            .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                                            .corner_radius(4),
-                                    );
-                                } else {
-                                    let (r, _) = ui.allocate_exact_size(
-                                        egui::vec2(40.0, 40.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        r,
-                                        egui::CornerRadius::same(4),
-                                        egui::Color32::from_rgb(0x30, 0x30, 0x30),
-                                    );
-                                }
-                                ui.add_space(8.0);
-                                // Duration first so the title truncates against it
-                                // instead of under it (360 px panel, long titles).
-                                // The text column lives INSIDE the right-to-left
-                                // closure: a bare `with_layout(right_to_left)`
-                                // moves the parent cursor past the right edge,
-                                // so a following sibling column is laid out
-                                // outside the row and the title goes invisible.
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            egui::RichText::new(format_secs(track.duration_secs))
-                                                .color(COLOR_TEXT_SECONDARY)
-                                                .size(12.0),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::top_down(egui::Align::Min),
-                                            |ui| {
-                                                ui.add_space(6.0);
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(&track.title)
-                                                            .color(if is_current {
-                                                                COLOR_ACCENT_RED
-                                                            } else {
-                                                                COLOR_TEXT_PRIMARY
-                                                            })
-                                                            .strong()
-                                                            .size(13.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(&track.artist)
-                                                            .color(COLOR_TEXT_SECONDARY)
-                                                            .size(12.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                            },
-                                        );
-                                    },
-                                );
-                            });
-                        });
+                        draw_queue_row_body(ui, row_rect, track, is_current);
                         if row_resp.clicked() {
                             actions.push(Action::Jump(pos));
                         }
                     }
                 });
         });
+}
+
+/// Body of one queue row inside its click rect: thumb + title/artist against
+/// the duration. Returns title/duration rects like `draw_track_row` for the
+/// headless layout test.
+fn draw_queue_row_body(
+    ui: &mut egui::Ui,
+    row_rect: egui::Rect,
+    track: &Track,
+    is_current: bool,
+) -> TrackRowRects {
+    let mut title_rect = egui::Rect::NOTHING;
+    let mut duration_rect = egui::Rect::NOTHING;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(4.0);
+            if let Some(url) = &track.thumb_url {
+                ui.add(
+                    egui::Image::from_uri(url)
+                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                        .corner_radius(4),
+                );
+            } else {
+                let (r, _) =
+                    ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    r,
+                    egui::CornerRadius::same(4),
+                    egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                );
+            }
+            ui.add_space(8.0);
+            // Duration first so the title truncates against it
+            // instead of under it (360 px panel, long titles).
+            // The text column lives INSIDE the right-to-left
+            // closure: a bare `with_layout(right_to_left)`
+            // moves the parent cursor past the right edge,
+            // so a following sibling column is laid out
+            // outside the row and the title goes invisible.
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.add_space(8.0);
+                    duration_rect = ui
+                        .label(
+                            egui::RichText::new(format_secs(track.duration_secs))
+                                .color(COLOR_TEXT_SECONDARY)
+                                .size(12.0),
+                        )
+                        .rect;
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.add_space(6.0);
+                            title_rect = ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&track.title)
+                                            .color(if is_current {
+                                                COLOR_ACCENT_RED
+                                            } else {
+                                                COLOR_TEXT_PRIMARY
+                                            })
+                                            .strong()
+                                            .size(13.0),
+                                    )
+                                    .truncate(),
+                                )
+                                .rect;
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&track.artist)
+                                        .color(COLOR_TEXT_SECONDARY)
+                                        .size(12.0),
+                                )
+                                .truncate(),
+                            );
+                        },
+                    );
+                },
+            );
+        });
+    });
+    TrackRowRects {
+        row: row_rect,
+        title: title_rect,
+        duration: duration_rect,
+    }
 }
 
 pub fn draw_card(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<Action>) {
@@ -1298,37 +1425,84 @@ mod tests {
         out
     }
 
+    /// Draw one queue row body headlessly at `width` (long title, no thumb).
+    fn queue_row_rects_at(width: f32) -> TrackRowRects {
+        let ctx = egui::Context::default();
+        let track = Track {
+            id: "t1".to_string(),
+            title: "A very long track title that must stay visible and truncate instead of sliding out of the row"
+                .to_string(),
+            artist: "Some Artist".to_string(),
+            album: "Some Album".to_string(),
+            duration_secs: 245,
+            thumb_url: None,
+            artist_id: None,
+            album_id: None,
+        };
+        let mut out = TrackRowRects {
+            row: egui::Rect::NOTHING,
+            title: egui::Rect::NOTHING,
+            duration: egui::Rect::NOTHING,
+        };
+        for _ in 0..2 {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(width, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let row_rect = egui::Rect::from_min_size(
+                            ui.available_rect_before_wrap().min,
+                            egui::vec2(ui.available_width(), 56.0),
+                        );
+                        out = draw_queue_row_body(ui, row_rect, &track, false);
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        out
+    }
+    fn assert_title_visible(r: TrackRowRects, width: f32, what: &str) {
+        assert!(r.row.width() > 0.0, "{what} row has no width at {width}");
+        // Title sits left of the duration, is wide, stays inside the
+        // row, and never overlaps the duration label.
+        assert!(
+            r.title.min.x < r.duration.min.x,
+            "{what} title not left of duration at {width}: {:?} vs {:?}",
+            r.title,
+            r.duration
+        );
+        assert!(
+            r.title.width() > 100.0,
+            "{what} title too narrow at {width}: {:?}",
+            r.title
+        );
+        assert!(
+            r.row.contains_rect(r.title),
+            "{what} title outside row at {width}: {:?} vs {:?}",
+            r.title,
+            r.row
+        );
+        assert!(
+            !r.title.intersects(r.duration),
+            "{what} title overlaps duration at {width}: {:?} vs {:?}",
+            r.title,
+            r.duration
+        );
+    }
+
     #[test]
     fn test_track_row_title_stays_visible() {
         for width in [360.0, 1000.0] {
-            let r = row_rects_at(width);
-            assert!(r.row.width() > 0.0, "row has no width at {width}");
-            // Title sits left of the duration, is wide, stays inside the
-            // row, and never overlaps the duration label.
-            assert!(
-                r.title.min.x < r.duration.min.x,
-                "title not left of duration at {width}: {:?} vs {:?}",
-                r.title,
-                r.duration
-            );
-            assert!(
-                r.title.width() > 100.0,
-                "title too narrow at {width}: {:?}",
-                r.title
-            );
-            assert!(
-                r.row.contains_rect(r.title),
-                "title outside row at {width}: {:?} vs {:?}",
-                r.title,
-                r.row
-            );
-            assert!(
-                !r.title.intersects(r.duration),
-                "title overlaps duration at {width}: {:?} vs {:?}",
-                r.title,
-                r.duration
-            );
+            assert_title_visible(row_rects_at(width), width, "track");
         }
+        // Queue panel rows share the same geometry contract at panel width.
+        assert_title_visible(queue_row_rects_at(360.0), 360.0, "queue");
     }
 
     #[test]
