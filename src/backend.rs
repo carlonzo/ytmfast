@@ -372,6 +372,13 @@ fn track_live_download_cookies(path: &Path) {
         .insert(path.to_path_buf());
 }
 
+fn is_live_download_cookie(path: &Path) -> bool {
+    LIVE_DOWNLOAD_COOKIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
 fn untrack_live_download_cookies(path: &Path) {
     LIVE_DOWNLOAD_COOKIES
         .lock()
@@ -408,8 +415,20 @@ async fn prepare_download_cookies(canonical: Option<&Path>) -> Option<PathBuf> {
         std::process::id(),
         DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
-    crate::auth::write_cookie_file(&tmp, &text).await.ok()?;
+    // Track BEFORE the write await: a SignOut landing in between drains a
+    // set that already contains this path, so the copy cannot survive
+    // sign-out. Lock is released before every `.await`.
     track_live_download_cookies(&tmp);
+    if crate::auth::write_cookie_file(&tmp, &text).await.is_err() {
+        untrack_live_download_cookies(&tmp);
+        return None;
+    }
+    if !is_live_download_cookie(&tmp) {
+        // Sign-out happened during the write: it already deleted whatever
+        // was on disk, but the file landed after the drain — remove it.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return None;
+    }
     Some(tmp)
 }
 
@@ -477,6 +496,16 @@ impl Backend {
             let cookies: std::sync::Arc<std::sync::RwLock<Option<PathBuf>>> =
                 std::sync::Arc::new(std::sync::RwLock::new(None));
             let cookie_file: Option<PathBuf> = crate::auth::cookie_path();
+            // 0700 the parent dir when it exists (same rationale as
+            // `secure_cookie_dir`: a 0644 copy re-created at exit by a
+            // still-running yt-dlp stays unreadable by other users).
+            // Missing dirs are created lazily at write time instead.
+            if let Some(path) = &cookie_file
+                && let Some(dir) = path.parent()
+                && std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
             // Delete leftover `cookies.<pid>.<counter>.tmp` copies from
             // crashed downloads; the canonical `cookies.txt` is untouched.
             if let Some(path) = &cookie_file

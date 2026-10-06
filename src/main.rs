@@ -90,26 +90,47 @@ fn stored_cookie_present() -> bool {
 fn is_private_view(view: &View) -> bool {
     matches!(view, View::Library | View::Playlist(_))
 }
+/// True when an event's generation matches the current auth generation:
+/// the single guard behind every Collection/Artist/PageError/Library
+/// drop-stale-result check. Pure so it is unit-testable.
+fn generation_current(event_gen: u64, current: u64) -> bool {
+    event_gen == current
+}
+/// Follow-up reload owed after an auth change. `#[must_use]`: an
+/// `Event::Auth` branch that drops this without calling `reload` leaves
+/// the open page stranded on a spinner, and the unused value warns.
+/// Consuming it via `reload` issues exactly one `ensure_view_loaded`
+/// re-request per auth event.
+#[must_use]
+struct AuthReload {
+    generation: u64,
+}
+impl AuthReload {
+    fn reload(self, app: &mut App) {
+        let current = app.nav.current.clone();
+        app.ensure_view_loaded(&current);
+    }
+}
 /// Bookkeeping shared by both `Event::Auth` branches, so a sign-in (like a
 /// sign-out) cannot strand an in-flight page on a spinner: bump the page
 /// generation — results carrying the old generation are dropped by the
-/// `generation != auth_generation` guards — and clear page loading
-/// sets/errors so `ensure_view_loaded` re-requests the open page. Returns
-/// the new generation for the follow-up request. Pure over its arguments
-/// so it is unit-testable without a GUI context.
+/// [`generation_current`] guards — and clear page loading sets/errors.
+/// Returns the owed [`AuthReload`]: the caller MUST consume it via
+/// `reload` so the open page is re-requested under the new generation.
+/// Pure over its arguments so it is unit-testable without a GUI context.
 fn auth_changed(
     generation: &mut u64,
     collections_loading: &mut HashSet<String>,
     collection_errors: &mut HashMap<String, String>,
     artists_loading: &mut HashSet<String>,
     artist_errors: &mut HashMap<String, String>,
-) -> u64 {
+) -> AuthReload {
     *generation = generation.wrapping_add(1);
     collections_loading.clear();
     collection_errors.clear();
     artists_loading.clear();
     artist_errors.clear();
-    *generation
+    AuthReload { generation: *generation }
 }
 
 /// How long a radio failure notice stays in the player bar before expiring.
@@ -653,7 +674,7 @@ impl eframe::App for App {
                     self.search_errors.insert(query, error);
                 }
                 Event::Collection { generation, collection } => {
-                    if generation != self.auth_generation {
+                    if !generation_current(generation, self.auth_generation) {
                         continue;
                     }
                     self.collections_loading.remove(&collection.id);
@@ -661,7 +682,7 @@ impl eframe::App for App {
                     self.collections.insert(collection.id.clone(), collection);
                 }
                 Event::Artist { generation, artist } => {
-                    if generation != self.auth_generation {
+                    if !generation_current(generation, self.auth_generation) {
                         continue;
                     }
                     self.artists_loading.remove(&artist.id);
@@ -695,7 +716,7 @@ impl eframe::App for App {
                     self.radio_error = Some((format!("Radio failed: {error}"), Instant::now()));
                 }
                 Event::PageError { id, kind, error, generation } => {
-                    if generation != self.auth_generation {
+                    if !generation_current(generation, self.auth_generation) {
                         continue;
                     }
                     match kind {
@@ -734,7 +755,7 @@ impl eframe::App for App {
                     self.signed_in = signed_in;
                     self.sign_in_busy = false;
                     if signed_in {
-                        let generation = auth_changed(
+                        let reload = auth_changed(
                             &mut self.auth_generation,
                             &mut self.collections_loading,
                             &mut self.collection_errors,
@@ -745,14 +766,13 @@ impl eframe::App for App {
                         self.show_sign_in = false;
                         self.library_loading = true;
                         self.library_error = None;
-                        self.backend.send(Cmd::LoadLibrary(generation));
-                        let current = self.nav.current.clone();
-                        self.ensure_view_loaded(&current);
+                        self.backend.send(Cmd::LoadLibrary(reload.generation));
+                        reload.reload(self);
                     } else if error.is_none() {
                         // Clean sign-out (not a failed sign-in): drop library
                         // and any cached private pages, then reload the open
                         // public page (if any) instead of leaving it blank.
-                        auth_changed(
+                        let reload = auth_changed(
                             &mut self.auth_generation,
                             &mut self.collections_loading,
                             &mut self.collection_errors,
@@ -765,14 +785,13 @@ impl eframe::App for App {
                         self.library_error = None;
                         self.collections.clear();
                         self.search_errors.clear();
-                        let current = self.nav.current.clone();
-                        self.ensure_view_loaded(&current);
+                        reload.reload(self);
                     } else {
                         self.auth_error = error;
                     }
                 }
                 Event::Library { generation, library } => {
-                    if !self.signed_in || generation != self.auth_generation {
+                    if !self.signed_in || !generation_current(generation, self.auth_generation) {
                         continue;
                     }
                     self.library_loading = false;
@@ -780,7 +799,7 @@ impl eframe::App for App {
                     self.library = Some(library);
                 }
                 Event::LibraryError { generation, error } => {
-                    if !self.signed_in || generation != self.auth_generation {
+                    if !self.signed_in || !generation_current(generation, self.auth_generation) {
                         continue;
                     }
                     self.library_loading = false;
@@ -1022,23 +1041,24 @@ mod tests {
         let mut collection_errors = HashMap::from([("old".to_string(), "e".to_string())]);
         let mut artists_loading = HashSet::from(["artist1".to_string()]);
         let mut artist_errors = HashMap::from([("old".to_string(), "e".to_string())]);
-        let new_generation = auth_changed(
+        let reload = auth_changed(
             &mut generation,
             &mut collections_loading,
             &mut collection_errors,
             &mut artists_loading,
             &mut artist_errors,
         );
-        assert_eq!(new_generation, old_generation.wrapping_add(1));
+        assert_eq!(reload.generation, old_generation.wrapping_add(1));
         assert!(collections_loading.is_empty());
         assert!(collection_errors.is_empty());
         assert!(artists_loading.is_empty());
         assert!(artist_errors.is_empty());
-        // Same check the Collection/Artist/PageError handlers run: the
-        // in-flight result (old generation) is rejected, the re-requested
-        // one (new generation) is accepted.
-        assert!(old_generation != generation);
-        assert!(new_generation == generation);
+        // Exercise the same guard the Collection/Artist/PageError/Library
+        // handlers run: the in-flight result (old generation) is
+        // rejected, the re-requested one (new generation) is accepted.
+        assert!(!generation_current(old_generation, generation));
+        assert!(generation_current(reload.generation, generation));
+        assert!(generation_current(generation, generation));
     }
 
 

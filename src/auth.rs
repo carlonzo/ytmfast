@@ -133,12 +133,37 @@ pub fn has_cookies(filtered: &str) -> bool {
     })
 }
 
+/// Lock the cookie dir to mode 0700: create it when missing, tighten it
+/// EVERY time (it may pre-exist with wider permissions). Refuses when the
+/// path is a symlink or not a directory. Rationale: a live private copy
+/// deleted at sign-out can be re-created at exit by a still-running yt-dlp
+/// with umask permissions (0644); a 0700 parent dir keeps that copy
+/// unreadable by other users. Never logs cookie contents.
+pub fn secure_cookie_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create config dir: {e}"))?;
+        }
+        Err(e) => return Err(format!("Cannot stat config dir: {e}")),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err("Refusing to write cookies: config dir is a symlink".to_string());
+            }
+            if !meta.is_dir() {
+                return Err("Refusing to write cookies: config path is not a directory".to_string());
+            }
+        }
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("Cannot secure config dir: {e}"))?;
+    Ok(())
+}
 
 /// Remove any existing file, then create with mode 0600 (`create_new`),
 /// write, and re-assert 0600. Never logs cookie contents.
 pub fn write_cookie_file_sync(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create config dir: {e}"))?;
+        secure_cookie_dir(parent)?;
     }
     let _ = std::fs::remove_file(path);
     let mut opts = std::fs::OpenOptions::new();
@@ -409,15 +434,30 @@ mod tests {
     #[test]
     fn test_write_cookie_file_sync_creates_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("ytmfast-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ytmfast-test-cookie-perms-{}", std::process::id()));
         let path = dir.join("cookies.txt");
         let _ = std::fs::remove_dir_all(&dir);
-        // Pre-existing 0644 file must be replaced with 0600.
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, "old").unwrap();
+        // Fresh dir: created 0700, file written 0600.
+        write_cookie_file_sync(&path, "FAKE-cookie-contents").unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Pre-existing 0755 dir + 0644 file: both tightened.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, "FAKE-old-contents").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_cookie_file_sync(&path, "new").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        write_cookie_file_sync(&path, "FAKE-new-contents").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "FAKE-new-contents");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
