@@ -64,7 +64,9 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     );
                                 }
 
-                                if row_resp.clicked() || row_resp.double_clicked() {
+                                // Double-click starts playback; no single-click
+                                // fire, so one gesture starts playback once.
+                                if row_resp.double_clicked() {
                                     let idx = home
                                         .top_songs
                                         .iter()
@@ -104,16 +106,22 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                             } else {
                                                 COLOR_TEXT_PRIMARY
                                             };
-                                            ui.label(
-                                                egui::RichText::new(&track.title)
-                                                    .color(title_col)
-                                                    .strong()
-                                                    .size(13.0),
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&track.title)
+                                                        .color(title_col)
+                                                        .strong()
+                                                        .size(13.0),
+                                                )
+                                                .truncate(),
                                             );
-                                            ui.label(
-                                                egui::RichText::new(&track.artist)
-                                                    .color(COLOR_TEXT_SECONDARY)
-                                                    .size(11.0),
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&track.artist)
+                                                        .color(COLOR_TEXT_SECONDARY)
+                                                        .size(11.0),
+                                                )
+                                                .truncate(),
                                             );
                                         });
                                     });
@@ -170,27 +178,7 @@ pub fn draw_explore(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
         return;
     };
 
-    // Header chips
-    ui.horizontal(|ui| {
-        let chip = |ui: &mut egui::Ui, label: &str| {
-            ui.add(
-                egui::Button::new(
-                    egui::RichText::new(label)
-                        .color(COLOR_TEXT_PRIMARY)
-                        .strong()
-                        .size(15.0),
-                )
-                .fill(COLOR_SURFACE)
-                .corner_radius(8)
-                .min_size(egui::vec2(160.0, 48.0)),
-            );
-        };
-        chip(ui, "New releases");
-        ui.add_space(12.0);
-        chip(ui, "Charts");
-    });
-
-    ui.add_space(20.0);
+    ui.add_space(4.0);
 
     // New albums shelf
     draw_shelf(ui, "New albums", &home.new_releases, "explore_new_albums", actions);
@@ -214,7 +202,7 @@ pub fn draw_explore(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                 track,
                 &home.top_songs,
                 current_id,
-                TrackRowConfig::DEFAULT,
+                TrackRowConfig::PLAYLIST,
                 actions,
             );
         }
@@ -335,16 +323,22 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                         }
                         ui.add_space(16.0);
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(&artist_card.title)
-                                    .color(COLOR_TEXT_PRIMARY)
-                                    .strong()
-                                    .size(22.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&artist_card.title)
+                                        .color(COLOR_TEXT_PRIMARY)
+                                        .strong()
+                                        .size(22.0),
+                                )
+                                .truncate(),
                             );
-                            ui.label(
-                                egui::RichText::new(&artist_card.subtitle)
-                                    .color(COLOR_TEXT_SECONDARY)
-                                    .size(13.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&artist_card.subtitle)
+                                        .color(COLOR_TEXT_SECONDARY)
+                                        .size(13.0),
+                                )
+                                .truncate(),
                             );
                         });
                     });
@@ -373,21 +367,27 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                         }
                         ui.add_space(16.0);
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(&track.title)
-                                    .color(COLOR_TEXT_PRIMARY)
-                                    .strong()
-                                    .size(20.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&track.title)
+                                        .color(COLOR_TEXT_PRIMARY)
+                                        .strong()
+                                        .size(20.0),
+                                )
+                                .truncate(),
                             );
                             let sub = if track.album.is_empty() {
                                 format!("Song • {}", track.artist)
                             } else {
                                 format!("Song • {} • {}", track.artist, track.album)
                             };
-                            ui.label(
-                                egui::RichText::new(sub)
-                                    .color(COLOR_TEXT_SECONDARY)
-                                    .size(13.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(sub)
+                                        .color(COLOR_TEXT_SECONDARY)
+                                        .size(13.0),
+                                )
+                                .truncate(),
                             );
                             ui.add_space(8.0);
                             let play_pill = egui::Button::image_and_text(
@@ -432,7 +432,7 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                 track,
                 &results.songs,
                 current_id,
-                TrackRowConfig::DEFAULT,
+                TrackRowConfig::PLAYLIST,
                 actions,
             );
         }
@@ -520,17 +520,23 @@ pub fn draw_collection(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec
                     .strong(),
             );
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(&collection.title)
-                    .color(COLOR_TEXT_PRIMARY)
-                    .size(36.0)
-                    .strong(),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&collection.title)
+                        .color(COLOR_TEXT_PRIMARY)
+                        .size(36.0)
+                        .strong(),
+                )
+                .truncate(),
             );
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(&collection.subtitle)
-                    .color(COLOR_TEXT_SECONDARY)
-                    .size(14.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&collection.subtitle)
+                        .color(COLOR_TEXT_SECONDARY)
+                        .size(14.0),
+                )
+                .truncate(),
             );
             ui.add_space(20.0);
 
@@ -673,17 +679,23 @@ pub fn draw_artist(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec<Act
             ui.horizontal(|ui| {
                 ui.add_space(24.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(&artist.name)
-                            .color(COLOR_TEXT_PRIMARY)
-                            .size(48.0)
-                            .strong(),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&artist.name)
+                                .color(COLOR_TEXT_PRIMARY)
+                                .size(48.0)
+                                .strong(),
+                        )
+                        .truncate(),
                     );
                     if let Some(sub) = &artist.subscribers {
-                        ui.label(
-                            egui::RichText::new(sub)
-                                .color(COLOR_TEXT_SECONDARY)
-                                .size(14.0),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(sub)
+                                    .color(COLOR_TEXT_SECONDARY)
+                                    .size(14.0),
+                            )
+                            .truncate(),
                         );
                     }
                     ui.add_space(16.0);
@@ -765,7 +777,7 @@ pub fn draw_artist(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec<Act
     draw_shelf(ui, "Albums", &artist.albums, "artist_albums", actions);
 
     // Singles
-    draw_shelf(ui, "Singles & EPs", &artist.singles, "artist_singles", actions);
+    draw_shelf(ui, "Singles", &artist.singles, "artist_singles", actions);
 
     ui.add_space(40.0);
 }

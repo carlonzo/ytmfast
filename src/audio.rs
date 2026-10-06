@@ -566,6 +566,38 @@ mod tests {
     }
 
     #[test]
+    fn test_peek_next_mirrors_next() {
+        // `peek_next()` must return exactly what `next(false)` then yields,
+        // across Off/All/One and shuffle on/off, including the last position.
+        for shuffle in [false, true] {
+            for repeat in [Repeat::Off, Repeat::All, Repeat::One] {
+                let mut q = Queue::new(make_test_tracks(4), 0);
+                q.repeat = repeat;
+                q.set_shuffle(shuffle);
+                // Walk every position, including the last one.
+                for _ in 0..4 {
+                    let peeked = q.peek_next().map(|t| t.id.clone());
+                    let advanced = q.next(false).map(|t| t.id.clone());
+                    assert_eq!(peeked, advanced, "shuffle={shuffle} repeat={repeat:?}");
+                }
+            }
+        }
+        // Single-track queue: Off => None; All wraps to itself; One => itself.
+        let mut single = Queue::new(make_test_tracks(1), 0);
+        assert_eq!(single.peek_next(), None);
+        single.repeat = Repeat::All;
+        assert_eq!(
+            single.peek_next().map(|t| t.id.clone()),
+            single.next(false).map(|t| t.id.clone())
+        );
+        single.repeat = Repeat::One;
+        assert_eq!(
+            single.peek_next().map(|t| t.id.clone()),
+            single.next(false).map(|t| t.id.clone())
+        );
+    }
+
+    #[test]
     fn test_queue_shuffle() {
         let tracks = make_test_tracks(20);
         let mut q = Queue::new(tracks, 15);

@@ -3,13 +3,14 @@ mod backend;
 mod ui;
 
 use audio::{Player, Queue};
-use backend::{ArtistPage, Backend, Cmd, Collection, Event, Home, SearchAll, Track};
+use backend::{ArtistPage, Backend, Cmd, Collection, Event, Home, PageKind, SearchAll, Track};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use ui::{Action, Nav, View};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub volume: f32,
     pub sidebar_collapsed: bool,
@@ -84,7 +85,11 @@ fn map_mpris_command(cmd: fastframe_now_playing::Command, current_id: Option<&st
         }
         C::SetVolume(v) => Some(Action::SetVolume(v as f32)),
         C::SetShuffle(s) => Some(Action::SetShuffle(s)),
-        C::SetRepeat(r) => Some(Action::SetRepeat(r)),
+        C::SetRepeat(r) => Some(Action::SetRepeat(match r {
+            fastframe_now_playing::Repeat::Off => audio::Repeat::Off,
+            fastframe_now_playing::Repeat::Track => audio::Repeat::One,
+            fastframe_now_playing::Repeat::Playlist => audio::Repeat::All,
+        })),
         C::Raise => Some(Action::Raise),
         C::Quit => Some(Action::Quit),
         C::OpenUri(_) => None,
@@ -103,9 +108,11 @@ pub struct App {
     pub is_active_playback: bool,
     pub queue_open: bool,
     pub prefetched: Option<String>,
+    pub radio_pending: Option<String>,
     pub now_playing: Option<fastframe_now_playing::NowPlaying>,
 
-    // Page cache
+    // Page cache. Search/collection/artist maps are unbounded for the
+    // session (ponytail: add eviction when it matters).
     pub home: Option<Home>,
     pub home_loading: bool,
     pub home_error: Option<String>,
@@ -142,6 +149,7 @@ impl App {
             is_active_playback: false,
             queue_open: false,
             prefetched: None,
+            radio_pending: None,
             now_playing: None,
             home: None,
             home_loading: true,
@@ -242,11 +250,20 @@ impl App {
                 shuffle,
             } => {
                 let target = tracks.get(start);
+                // One gesture starts playback once: a double-click's second
+                // PlayList for the track that just started (< 1 s in) is a no-op.
                 if self.is_loading
                     && self.queue.current().map(|t| &t.id) == target.map(|t| &t.id)
                 {
                     return;
                 }
+                if !self.is_loading
+                    && self.queue.current().map(|t| &t.id) == target.map(|t| &t.id)
+                    && self.player.position() < Duration::from_secs(1)
+                {
+                    return;
+                }
+                self.radio_pending = None;
                 let prev_repeat = self.queue.repeat;
                 let prev_shuffle = match shuffle {
                     Some(s) => s,
@@ -281,8 +298,7 @@ impl App {
                 self.maybe_prefetch();
             }
             Action::Jump(pos) => {
-                let target = self.queue.order.get(pos).and_then(|&i| self.queue.tracks.get(i));
-                if self.is_loading && self.queue.current().map(|t| &t.id) == target.map(|t| &t.id) {
+                if self.is_loading && pos == self.queue.pos {
                     return;
                 }
                 if let Some(track) = self.queue.jump(pos).cloned() {
@@ -297,11 +313,7 @@ impl App {
                 self.maybe_prefetch();
             }
             Action::SetRepeat(r) => {
-                self.queue.repeat = match r {
-                    fastframe_now_playing::Repeat::Off => audio::Repeat::Off,
-                    fastframe_now_playing::Repeat::Track => audio::Repeat::One,
-                    fastframe_now_playing::Repeat::Playlist => audio::Repeat::All,
-                };
+                self.queue.repeat = r;
                 self.maybe_prefetch();
             }
             Action::Resume => {
@@ -315,12 +327,16 @@ impl App {
                 }
             }
             Action::SeekRelative(ms) => {
+                let Some(dur) = self.player.duration() else {
+                    return;
+                };
                 let cur = self.player.position();
                 let target = if ms >= 0 {
                     cur + Duration::from_millis(ms as u64)
                 } else {
                     cur.saturating_sub(Duration::from_millis(ms.unsigned_abs()))
                 };
+                let target = target.min(dur);
                 self.player.seek(target);
                 if let Some(np) = &self.now_playing {
                     np.seeked(target);
@@ -331,11 +347,18 @@ impl App {
             Action::PrevTrack => {
                 if self.player.position() > Duration::from_secs(3) {
                     self.player.seek(Duration::ZERO);
+                    if let Some(np) = &self.now_playing {
+                        np.seeked(Duration::ZERO);
+                    }
                 } else if let Some(track) = self.queue.prev().cloned() {
                     self.start_track(track);
                 }
             }
             Action::Seek(pos) => {
+                let Some(dur) = self.player.duration() else {
+                    return;
+                };
+                let pos = pos.min(dur);
                 self.player.seek(pos);
                 if let Some(np) = &self.now_playing {
                     np.seeked(pos);
@@ -357,6 +380,10 @@ impl App {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
             }
             Action::Radio(video_id) => {
+                if self.radio_pending.as_deref() == Some(video_id.as_str()) {
+                    return;
+                }
+                self.radio_pending = Some(video_id.clone());
                 self.backend.send(Cmd::Radio(video_id));
             }
             Action::Retry(view) => match view {
@@ -426,21 +453,41 @@ impl eframe::App for App {
                     self.artist_errors.remove(&artist.id);
                     self.artists.insert(artist.id.clone(), artist);
                 }
-                Event::Radio { id: _, tracks } => {
+                Event::Radio { id, tracks } => {
+                    if self.radio_pending.as_deref() != Some(id.as_str()) {
+                        return;
+                    }
+                    self.radio_pending = None;
                     if !tracks.is_empty() {
                         let prev_repeat = self.queue.repeat;
+                        let prev_shuffle = self.queue.shuffle;
                         self.queue = Queue::new(tracks, 0);
                         self.queue.repeat = prev_repeat;
+                        self.queue.set_shuffle(prev_shuffle);
                         if let Some(track) = self.queue.current().cloned() {
                             self.start_track(track);
                         }
                     }
                 }
-                Event::PageError { id, error } => {
-                    self.collections_loading.remove(&id);
-                    self.collection_errors.insert(id.clone(), error.clone());
-                    self.artists_loading.remove(&id);
-                    self.artist_errors.insert(id, error);
+                Event::RadioError { id, error } => {
+                    if self.radio_pending.as_deref() != Some(id.as_str()) {
+                        return;
+                    }
+                    self.radio_pending = None;
+                    self.is_loading = false;
+                    self.fetch_error = Some(format!("Radio failed: {error}"));
+                }
+                Event::PageError { id, kind, error } => {
+                    match kind {
+                        PageKind::Collection => {
+                            self.collections_loading.remove(&id);
+                            self.collection_errors.insert(id, error);
+                        }
+                        PageKind::Artist => {
+                            self.artists_loading.remove(&id);
+                            self.artist_errors.insert(id, error);
+                        }
+                    }
                 }
                 Event::Ready { id, path } => {
                     if self.is_loading
@@ -548,6 +595,8 @@ impl App {
             artists: vec![t.artist.clone()],
             album: t.album.clone(),
             duration: Some(Duration::from_secs(t.duration_secs as u64)),
+            // ponytail: Track carries only the small thumb_url; prefer a large
+            // thumbnail here once the backend provides one.
             art_url: t.thumb_url.clone(),
             ..Default::default()
         });
@@ -712,18 +761,40 @@ mod tests {
         );
         assert!(matches!(
             map_mpris_command(C::SetVolume(0.5), id),
-            Some(Action::SetVolume(_))
+            Some(Action::SetVolume(v)) if v == 0.5_f32
+        ));
+        assert!(matches!(
+            map_mpris_command(C::SetVolume(0.0), id),
+            Some(Action::SetVolume(v)) if v == 0.0_f32
         ));
         assert!(matches!(
             map_mpris_command(C::SetShuffle(true), id),
             Some(Action::SetShuffle(true))
         ));
         assert!(matches!(
+            map_mpris_command(C::SetShuffle(false), id),
+            Some(Action::SetShuffle(false))
+        ));
+        assert!(matches!(
             map_mpris_command(
                 C::SetRepeat(fastframe_now_playing::Repeat::Track),
                 id,
             ),
-            Some(Action::SetRepeat(_))
+            Some(Action::SetRepeat(audio::Repeat::One))
+        ));
+        assert!(matches!(
+            map_mpris_command(
+                C::SetRepeat(fastframe_now_playing::Repeat::Playlist),
+                id,
+            ),
+            Some(Action::SetRepeat(audio::Repeat::All))
+        ));
+        assert!(matches!(
+            map_mpris_command(
+                C::SetRepeat(fastframe_now_playing::Repeat::Off),
+                id,
+            ),
+            Some(Action::SetRepeat(audio::Repeat::Off))
         ));
         assert!(matches!(
             map_mpris_command(C::Raise, id),
@@ -731,5 +802,21 @@ mod tests {
         ));
         assert!(matches!(map_mpris_command(C::Quit, id), Some(Action::Quit)));
         assert!(map_mpris_command(C::OpenUri("x".to_string()), id).is_none());
+    }
+
+    #[test]
+    fn test_settings_missing_fields_use_defaults() {
+        // `{}` (and partial objects from older versions) must not reset
+        // saved settings: every missing field falls back to Default.
+        let empty: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, Settings::default());
+
+        let partial: Settings = serde_json::from_str(r#"{"volume": 0.25}"#).unwrap();
+        assert_eq!(partial.volume, 0.25);
+        assert!(!partial.sidebar_collapsed);
+        assert!(!partial.shuffle);
+        assert_eq!(partial.repeat, audio::Repeat::Off);
+        assert!(!partial.queue_open);
+        assert_eq!(partial.last_view, View::Home);
     }
 }

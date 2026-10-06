@@ -19,7 +19,10 @@ fastframe_icons::icons! {
     pub enum Icon {
         prefix: "ytm-icon-",
         directory: "../../assets/icons/",
-        Menu => lucide "panel-left",
+        Menu => "menu",
+        Home => "house",
+        Explore => "compass",
+        Library => "library",
         Search => lucide "search",
         Back => lucide "arrow-left",
         Play => lucide "play",
@@ -113,28 +116,29 @@ impl TrackRowConfig {
         show_thumb: true,
         show_album: false,
     };
-    pub const DEFAULT: Self = Self {
-        show_index: false,
-        show_thumb: true,
-        show_album: true,
-    };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TopResult {
-    Artist(Card),
-    Song(Track),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopResult<'a> {
+    Artist(&'a Card),
+    Song(&'a Track),
 }
 
-pub fn pick_top_result(query: &str, songs: &[Track], artists: &[Card]) -> Option<TopResult> {
+pub fn pick_top_result<'a>(
+    query: &str,
+    songs: &'a [Track],
+    artists: &'a [Card],
+) -> Option<TopResult<'a>> {
     let q_clean = query.trim().to_lowercase();
     if !q_clean.is_empty() {
-        let matched = artists.iter().find(|a| a.title.trim().to_lowercase() == q_clean);
+        let matched = artists
+            .iter()
+            .find(|a| a.title.trim().eq_ignore_ascii_case(q_clean.as_str()));
         if let Some(artist) = matched {
-            return Some(TopResult::Artist(artist.clone()));
+            return Some(TopResult::Artist(artist));
         }
     }
-    songs.first().cloned().map(TopResult::Song)
+    songs.first().map(TopResult::Song)
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +156,7 @@ pub enum Action {
     ToggleShuffle,
     CycleRepeat,
     SetShuffle(bool),
-    SetRepeat(fastframe_now_playing::Repeat),
+    SetRepeat(crate::audio::Repeat),
     Jump(usize),
     ToggleQueue,
     Resume,
@@ -188,6 +192,9 @@ pub fn apply_theme(ctx: &egui::Context) {
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
     visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
     ctx.set_visuals(visuals);
+    // Rows/cards allocate their click rect first and draw text inside it;
+    // selectable labels would sense clicks over the text and swallow them.
+    ctx.global_style_mut(|s| s.interaction.selectable_labels = false);
 }
 
 pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -345,12 +352,12 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
             let is_collapsed = app.sidebar_collapsed;
 
             let items = [
-                ("Home", "🏠", View::Home),
-                ("Explore", "🧭", View::Explore),
-                ("Library", "📚", View::Library),
+                ("Home", Icon::Home, View::Home),
+                ("Explore", Icon::Explore, View::Explore),
+                ("Library", Icon::Library, View::Library),
             ];
 
-            for (label, glyph, view) in items {
+            for (label, icon, view) in items {
                 let is_active = app.nav.current == view;
                 let bg_color = if is_active {
                     COLOR_SURFACE
@@ -380,16 +387,26 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.vertical_centered(|ui| {
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new(glyph).size(16.0));
+                            ui.add(icon.image(
+                                if is_active {
+                                    COLOR_TEXT_PRIMARY
+                                } else {
+                                    COLOR_TEXT_SECONDARY
+                                },
+                                16.0,
+                            ));
                             ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(label)
-                                    .color(if is_active {
-                                        COLOR_TEXT_PRIMARY
-                                    } else {
-                                        COLOR_TEXT_SECONDARY
-                                    })
-                                    .size(10.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .color(if is_active {
+                                            COLOR_TEXT_PRIMARY
+                                        } else {
+                                            COLOR_TEXT_SECONDARY
+                                        })
+                                        .size(10.0),
+                                )
+                                .truncate(),
                             );
                         });
                     });
@@ -397,17 +414,27 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         ui.horizontal_centered(|ui| {
                             ui.add_space(14.0);
-                            ui.label(egui::RichText::new(glyph).size(18.0));
+                            ui.add(icon.image(
+                                if is_active {
+                                    COLOR_TEXT_PRIMARY
+                                } else {
+                                    COLOR_TEXT_SECONDARY
+                                },
+                                18.0,
+                            ));
                             ui.add_space(14.0);
-                            ui.label(
-                                egui::RichText::new(label)
-                                    .color(if is_active {
-                                        COLOR_TEXT_PRIMARY
-                                    } else {
-                                        COLOR_TEXT_SECONDARY
-                                    })
-                                    .strong()
-                                    .size(14.0),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .color(if is_active {
+                                            COLOR_TEXT_PRIMARY
+                                        } else {
+                                            COLOR_TEXT_SECONDARY
+                                        })
+                                        .strong()
+                                        .size(14.0),
+                                )
+                                .truncate(),
                             );
                         });
                     });
@@ -580,6 +607,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
 
+                    // Right-to-left order on screen: volume, repeat, shuffle, queue.
                     let queue_color = if app.queue_open {
                         COLOR_ACCENT_RED
                     } else {
@@ -595,6 +623,39 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                         .clicked()
                     {
                         actions.push(Action::ToggleQueue);
+                    }
+                    ui.add_space(8.0);
+
+                    let shuf_color = if app.queue.shuffle {
+                        COLOR_ACCENT_RED
+                    } else {
+                        egui::Color32::from_rgb(0x88, 0x88, 0x88)
+                    };
+                    let shuf_tip = if app.queue.shuffle { "Shuffle on" } else { "Shuffle off" };
+                    if ui
+                        .add(egui::Button::image(Icon::Shuffle.image(shuf_color, 16.0)).frame(false))
+                        .on_hover_text(shuf_tip)
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleShuffle);
+                    }
+                    ui.add_space(8.0);
+
+                    let (rep_icon, rep_color, rep_tip) = match app.queue.repeat {
+                        Repeat::Off => (
+                            Icon::Repeat,
+                            egui::Color32::from_rgb(0x88, 0x88, 0x88),
+                            "Repeat off",
+                        ),
+                        Repeat::All => (Icon::Repeat, COLOR_TEXT_PRIMARY, "Repeat all"),
+                        Repeat::One => (Icon::RepeatOne, COLOR_ACCENT_RED, "Repeat one"),
+                    };
+                    if ui
+                        .add(egui::Button::image(rep_icon.image(rep_color, 16.0)).frame(false))
+                        .on_hover_text(rep_tip)
+                        .clicked()
+                    {
+                        actions.push(Action::CycleRepeat);
                     }
                     ui.add_space(8.0);
 
@@ -615,38 +676,6 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                         Icon::VolumeMute.image(COLOR_TEXT_SECONDARY, 16.0)
                     };
                     ui.add(vol_icon);
-                    ui.add_space(8.0);
-
-                    let shuf_color = if app.queue.shuffle {
-                        COLOR_ACCENT_RED
-                    } else {
-                        egui::Color32::from_rgb(0x88, 0x88, 0x88)
-                    };
-                    let shuf_tip = if app.queue.shuffle { "Shuffle on" } else { "Shuffle off" };
-                    if ui
-                        .add(egui::Button::image(Icon::Shuffle.image(shuf_color, 16.0)).frame(false))
-                        .on_hover_text(shuf_tip)
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleShuffle);
-                    }
-
-                    let (rep_icon, rep_color, rep_tip) = match app.queue.repeat {
-                        Repeat::Off => (
-                            Icon::Repeat,
-                            egui::Color32::from_rgb(0x88, 0x88, 0x88),
-                            "Repeat off",
-                        ),
-                        Repeat::All => (Icon::Repeat, COLOR_TEXT_PRIMARY, "Repeat all"),
-                        Repeat::One => (Icon::RepeatOne, COLOR_ACCENT_RED, "Repeat one"),
-                    };
-                    if ui
-                        .add(egui::Button::image(rep_icon.image(rep_color, 16.0)).frame(false))
-                        .on_hover_text(rep_tip)
-                        .clicked()
-                    {
-                        actions.push(Action::CycleRepeat);
-                    }
                     ui.add_space(16.0);
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -671,11 +700,14 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                             ui.add_space(8.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&track.title)
-                                            .color(COLOR_TEXT_PRIMARY)
-                                            .strong()
-                                            .size(13.0),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&track.title)
+                                                .color(COLOR_TEXT_PRIMARY)
+                                                .strong()
+                                                .size(13.0),
+                                        )
+                                        .truncate(),
                                     );
                                     if app.is_loading {
                                         ui.label(
@@ -686,10 +718,13 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                                     }
                                 });
                                 if let Some(err) = &app.fetch_error {
-                                    ui.label(
-                                        egui::RichText::new(err)
-                                            .color(egui::Color32::from_rgb(0xFF, 0x44, 0x44))
-                                            .size(11.0),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(err)
+                                                .color(egui::Color32::from_rgb(0xFF, 0x44, 0x44))
+                                                .size(11.0),
+                                        )
+                                        .truncate(),
                                     );
                                 } else {
                                     let meta = if track.album.is_empty() {
@@ -697,10 +732,13 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                                     } else {
                                         format!("{} • {}", track.artist, track.album)
                                     };
-                                    ui.label(
-                                        egui::RichText::new(meta)
-                                            .color(COLOR_TEXT_SECONDARY)
-                                            .size(11.0),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(meta)
+                                                .color(COLOR_TEXT_SECONDARY)
+                                                .size(11.0),
+                                        )
+                                        .truncate(),
                                     );
                                 }
                             });
@@ -715,9 +753,9 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
 /// jumps. `show_rows` keeps long queues cheap; auto-scrolls only when the
 /// current track changes.
 pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
-    let current_id = app.queue.current().map(|t| t.id.clone());
-    let order: Vec<usize> = app.queue.order.clone();
-    let tracks: Vec<Track> = app.queue.tracks.clone();
+    let order = &app.queue.order;
+    let tracks = &app.queue.tracks;
+    let current_pos = app.queue.pos;
     let order_len = order.len();
 
     egui::Panel::right("queue_panel")
@@ -739,32 +777,31 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                 egui::Stroke::new(1.0, COLOR_DIVIDER),
             );
 
-            ui.label(
-                egui::RichText::new("Up next")
-                    .color(COLOR_TEXT_PRIMARY)
-                    .strong()
-                    .size(16.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Up next")
+                        .color(COLOR_TEXT_PRIMARY)
+                        .strong()
+                        .size(16.0),
+                )
+                .truncate(),
             );
             ui.add_space(8.0);
 
             let row_h = 56.0;
-            // Scroll the current row into view only when the track changed,
-            // not every frame. `show_rows` virtualizes rows, so a far-away
-            // current row has no widget to `scroll_to_me` — jump via an
-            // explicit scroll offset instead.
-            let seen_id = ui.data_mut(|d| d.get_temp::<String>(ui.id().with("queue_seen_id")));
-            let scroll_to_current = seen_id != current_id;
+            // Scroll the current row into view only when the position
+            // changed, not every frame. `show_rows` virtualizes rows, so a
+            // far-away current row has no widget to `scroll_to_me` — jump
+            // via an explicit scroll offset instead.
+            let seen_pos = ui.data_mut(|d| d.get_temp::<usize>(ui.id().with("queue_seen_pos")));
+            let scroll_to_current = seen_pos != Some(current_pos);
             ui.data_mut(|d| {
-                if let Some(id) = current_id.clone() {
-                    d.insert_temp(ui.id().with("queue_seen_id"), id);
-                } else {
-                    d.remove_temp::<String>(ui.id().with("queue_seen_id"));
-                }
+                d.insert_temp(ui.id().with("queue_seen_pos"), current_pos);
             });
             let spacing_y = ui.spacing().item_spacing.y;
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
             if scroll_to_current {
-                scroll = scroll.vertical_scroll_offset(app.queue.pos as f32 * (row_h + spacing_y));
+                scroll = scroll.vertical_scroll_offset(current_pos as f32 * (row_h + spacing_y));
             }
             scroll.show_rows(ui, row_h, order_len, |ui, range| {
                     for pos in range {
@@ -774,7 +811,7 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                         let Some(track) = tracks.get(track_idx) else {
                             continue;
                         };
-                        let is_current = current_id.as_deref() == Some(track.id.as_str());
+                        let is_current = pos == current_pos;
                         let (row_rect, row_resp) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), row_h),
                             egui::Sense::click(),
@@ -809,20 +846,26 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                                 ui.add_space(8.0);
                                 ui.vertical(|ui| {
                                     ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(&track.title)
-                                            .color(if is_current {
-                                                COLOR_ACCENT_RED
-                                            } else {
-                                                COLOR_TEXT_PRIMARY
-                                            })
-                                            .strong()
-                                            .size(13.0),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&track.title)
+                                                .color(if is_current {
+                                                    COLOR_ACCENT_RED
+                                                } else {
+                                                    COLOR_TEXT_PRIMARY
+                                                })
+                                                .strong()
+                                                .size(13.0),
+                                        )
+                                        .truncate(),
                                     );
-                                    ui.label(
-                                        egui::RichText::new(&track.artist)
-                                            .color(COLOR_TEXT_SECONDARY)
-                                            .size(12.0),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&track.artist)
+                                                .color(COLOR_TEXT_SECONDARY)
+                                                .size(12.0),
+                                        )
+                                        .truncate(),
                                     );
                                 });
                                 ui.with_layout(
@@ -884,20 +927,27 @@ pub fn draw_card(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<Action>) {
                         .corner_radius(corner),
                 );
             } else {
+                ui.allocate_rect(art_rect, egui::Sense::hover());
                 ui.painter().rect_filled(art_rect, corner, egui::Color32::from_rgb(0x30, 0x30, 0x30));
             }
 
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(&card.title)
-                    .color(COLOR_TEXT_PRIMARY)
-                    .strong()
-                    .size(14.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&card.title)
+                        .color(COLOR_TEXT_PRIMARY)
+                        .strong()
+                        .size(14.0),
+                )
+                .truncate(),
             );
-            ui.label(
-                egui::RichText::new(&card.subtitle)
-                    .color(COLOR_TEXT_SECONDARY)
-                    .size(12.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&card.subtitle)
+                        .color(COLOR_TEXT_SECONDARY)
+                        .size(12.0),
+                )
+                .truncate(),
             );
         });
     });
@@ -981,12 +1031,11 @@ pub fn draw_track_row(
                             .fit_to_exact_size(egui::vec2(16.0, 16.0)),
                     );
                 } else if is_current {
-                    ui.painter().text(
-                        btn_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "▶",
-                        egui::FontId::proportional(14.0),
-                        COLOR_ACCENT_RED,
+                    ui.put(
+                        btn_rect,
+                        egui::Image::new(Icon::Play.uri())
+                            .tint(COLOR_ACCENT_RED)
+                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
                     );
                 } else {
                     ui.painter().text(
@@ -1045,26 +1094,35 @@ pub fn draw_track_row(
 
             ui.vertical(|ui| {
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(&track.title)
-                        .color(title_color)
-                        .strong()
-                        .size(14.0),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&track.title)
+                            .color(title_color)
+                            .strong()
+                            .size(14.0),
+                    )
+                    .truncate(),
                 );
-                ui.label(
-                    egui::RichText::new(&track.artist)
-                        .color(COLOR_TEXT_SECONDARY)
-                        .size(12.0),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&track.artist)
+                            .color(COLOR_TEXT_SECONDARY)
+                            .size(12.0),
+                    )
+                    .truncate(),
                 );
             });
 
             // Album column (if broad enough and requested)
             if config.show_album && row_width > 600.0 && !track.album.is_empty() {
                 ui.add_space(32.0);
-                ui.label(
-                    egui::RichText::new(&track.album)
-                        .color(COLOR_TEXT_SECONDARY)
-                        .size(13.0),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&track.album)
+                            .color(COLOR_TEXT_SECONDARY)
+                            .size(13.0),
+                    )
+                    .truncate(),
                 );
             }
 
@@ -1099,6 +1157,7 @@ pub fn draw_central_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action
         )
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
+                .id_salt(&app.nav.current)
                 .auto_shrink([false, false])
                 .show(ui, |ui| match &app.nav.current {
                     View::Home => draw_home(ui, app, actions),
@@ -1196,24 +1255,24 @@ mod tests {
         // Artist exact match (case-insensitive) -> chooses artist
         assert_eq!(
             pick_top_result("daft punk", &songs, &artists),
-            Some(TopResult::Artist(artists[0].clone()))
+            Some(TopResult::Artist(&artists[0]))
         );
 
         assert_eq!(
             pick_top_result("DAFT PUNK ", &songs, &artists),
-            Some(TopResult::Artist(artists[0].clone()))
+            Some(TopResult::Artist(&artists[0]))
         );
 
         // No artist match -> chooses first song
         assert_eq!(
             pick_top_result("around the world", &songs, &artists),
-            Some(TopResult::Song(songs[0].clone()))
+            Some(TopResult::Song(&songs[0]))
         );
 
         // No artists present -> chooses first song
         assert_eq!(
             pick_top_result("daft punk", &songs, &[]),
-            Some(TopResult::Song(songs[0].clone()))
+            Some(TopResult::Song(&songs[0]))
         );
 
         // Both empty -> None

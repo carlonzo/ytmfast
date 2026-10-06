@@ -30,11 +30,10 @@ pub struct Card {
     pub thumb_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct Shelf {
-    pub title: String,
-    pub cards: Vec<Card>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageKind {
+    Collection,
+    Artist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +95,12 @@ pub enum Event {
     Collection(Collection),
     Artist(ArtistPage),
     Radio { id: String, tracks: Vec<Track> },
-    PageError { id: String, error: String },
+    RadioError { id: String, error: String },
+    PageError {
+        id: String,
+        kind: PageKind,
+        error: String,
+    },
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
 }
@@ -539,6 +543,7 @@ impl Backend {
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
+                                                kind: PageKind::Collection,
                                                 error: e.to_string(),
                                             });
                                         }
@@ -547,7 +552,7 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
                                 }
                                 ctx.request_repaint();
                             }
@@ -596,6 +601,7 @@ impl Backend {
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
+                                                kind: PageKind::Collection,
                                                 error: e.to_string(),
                                             });
                                         }
@@ -604,7 +610,7 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
                                 }
                                 ctx.request_repaint();
                             }
@@ -638,6 +644,7 @@ impl Backend {
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
+                                                kind: PageKind::Artist,
                                                 error: e.to_string(),
                                             });
                                         }
@@ -646,7 +653,7 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err });
                                 }
                                 ctx.request_repaint();
                             }
@@ -662,7 +669,7 @@ impl Backend {
                                             let _ = event_tx.send(Event::Radio { id, tracks });
                                         }
                                         Err(e) => {
-                                            let _ = event_tx.send(Event::PageError {
+                                            let _ = event_tx.send(Event::RadioError {
                                                 id,
                                                 error: e.to_string(),
                                             });
@@ -672,7 +679,7 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, error: err });
+                                    let _ = event_tx.send(Event::RadioError { id, error: err });
                                 }
                                 ctx.request_repaint();
                             }
@@ -696,9 +703,7 @@ impl Backend {
                             Cmd::Prefetch(track) => {
                                 // Warm the cache for the likely-next track. No
                                 // event on success; failures stay silent.
-                                if crate::audio::fetch(&track.id, None).await.is_err() {
-                                    eprintln!("prefetch failed: {}", track.id);
-                                }
+                                let _ = crate::audio::fetch(&track.id, None).await;
                                 ctx.request_repaint();
                             }
                         }
@@ -712,8 +717,14 @@ impl Backend {
                         Cmd::Search(query) => {
                             let _ = event_tx.send(Event::SearchError { query, error: err });
                         }
-                        Cmd::OpenAlbum(id) | Cmd::OpenPlaylist(id) | Cmd::OpenArtist(id) | Cmd::Radio(id) => {
-                            let _ = event_tx.send(Event::PageError { id, error: err });
+                        Cmd::OpenAlbum(id) | Cmd::OpenPlaylist(id) => {
+                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
+                        }
+                        Cmd::OpenArtist(id) => {
+                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err });
+                        }
+                        Cmd::Radio(id) => {
+                            let _ = event_tx.send(Event::RadioError { id, error: err });
                         }
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
@@ -877,18 +888,6 @@ mod tests {
 
         let charts = charts_res.expect("music_charts failed");
         let new_albums = new_albums_res.expect("music_new_albums failed");
-
-        eprintln!(
-            "Charts debug: top_tracks={}, trending_tracks={}, artists={}, playlists={}, top_pl_id={:?}",
-            charts.top_tracks.len(),
-            charts.trending_tracks.len(),
-            charts.artists.len(),
-            charts.playlists.len(),
-            charts.top_playlist_id,
-        );
-        for p in charts.playlists.iter().take(5) {
-            eprintln!("  playlist: id={} name={}", p.id, p.name);
-        }
 
         let mut top_songs: Vec<Track> = charts.top_tracks.into_iter().map(track_from).collect();
         if top_songs.is_empty()
