@@ -132,10 +132,8 @@ pub fn draw_sign_in_dialog(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<A
                 }
             });
         });
-    if !open {
-        actions.push(Action::HideSignIn);
-    }
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    // Window close and Escape can fire in the same frame: push at most one.
+    if !open || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.push(Action::HideSignIn);
     }
 }

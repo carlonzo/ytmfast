@@ -23,6 +23,38 @@ pub fn cookie_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.config_dir().join("ytmfast").join("cookies.txt"))
 }
 
+/// Private per-download cookie copy next to the canonical jar:
+/// `<dir>/cookies.<pid>.<counter>.tmp`. yt-dlp rewrites the `--cookies`
+/// file when it exits, so downloads NEVER get the canonical path: each
+/// Fetch/Prefetch copies the jar here (0600) and deletes it afterwards.
+pub fn download_cookie_path(canonical: &Path, pid: u32, counter: u64) -> PathBuf {
+    canonical
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("cookies.{pid}.{counter}.tmp"))
+}
+
+/// True only for `cookies.<digits>.<digits>.tmp` leftovers from a crashed
+/// download; never `cookies.txt` or anything else.
+pub fn is_download_cookie_leftover(file_name: &str) -> bool {
+    let Some(rest) = file_name
+        .strip_prefix("cookies.")
+        .and_then(|s| s.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), None) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
 /// True iff the browser name is in the fixed allowlist (exact match).
 pub fn is_allowed_browser(browser: &str) -> bool {
     ALLOWED_BROWSERS.contains(&browser)
@@ -391,5 +423,32 @@ mod tests {
             0o600
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_download_cookie_paths_unique_and_private() {
+        let canonical = Path::new("/home/u/.config/ytmfast/cookies.txt");
+        let a = download_cookie_path(canonical, 123, 1);
+        let b = download_cookie_path(canonical, 123, 2);
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), canonical.parent());
+        assert_eq!(
+            a.file_name().and_then(|n| n.to_str()),
+            Some("cookies.123.1.tmp")
+        );
+        assert!(is_download_cookie_leftover("cookies.123.1.tmp"));
+        assert!(is_download_cookie_leftover("cookies.1.0.tmp"));
+    }
+
+    #[test]
+    fn test_download_cookie_leftover_pattern_narrow() {
+        assert!(!is_download_cookie_leftover("cookies.txt"));
+        assert!(!is_download_cookie_leftover("cookies.123.tmp"));
+        assert!(!is_download_cookie_leftover("cookies.abc.1.tmp"));
+        assert!(!is_download_cookie_leftover("cookies.1.2.tmpx"));
+        assert!(!is_download_cookie_leftover("cookies..tmp"));
+        assert!(!is_download_cookie_leftover("cookies.1.2.3.tmp"));
+        assert!(!is_download_cookie_leftover("other.txt"));
+        assert!(!is_download_cookie_leftover(""));
     }
 }

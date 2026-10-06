@@ -95,9 +95,9 @@ pub enum SignInSource {
 pub enum Cmd {
     LoadHome,
     Search(String),
-    OpenAlbum(String),
-    OpenPlaylist(String),
-    OpenArtist(String),
+    OpenAlbum(String, u64),
+    OpenPlaylist(String, u64),
+    OpenArtist(String, u64),
     Radio(String),
     Fetch(Track),
     Prefetch(Track),
@@ -111,14 +111,15 @@ pub enum Event {
     HomeError(String),
     SearchResults(SearchAll),
     SearchError { query: String, error: String },
-    Collection(Collection),
-    Artist(ArtistPage),
+    Collection { generation: u64, collection: Collection },
+    Artist { generation: u64, artist: ArtistPage },
     Radio { id: String, tracks: Vec<Track> },
     RadioError { id: String, error: String },
     PageError {
         id: String,
         kind: PageKind,
         error: String,
+        generation: u64,
     },
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
@@ -350,22 +351,33 @@ fn cookie_path_now(cookies: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathB
     cookies.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Re-remove the cookie file when signed out now: a yt-dlp download started
-/// with `--cookies` rewrites it when it exits, so a download still running
-/// at sign-out re-creates the file. Call only after a download that was
-/// actually given a cookie path. The lock is dropped before the fs call;
-/// errors ignored.
-async fn scrub_recreated_cookies(
-    cookies: &std::sync::RwLock<Option<PathBuf>>,
-    cookie_file: Option<&Path>,
-) {
-    if cookie_path_now(cookies).is_none()
-        && let Some(path) = cookie_file
-    {
+/// Counter for unique per-download cookie copies (`download_cookie_path`).
+static DOWNLOAD_COOKIE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Copy the canonical jar to a private 0600 file for one download: yt-dlp
+/// rewrites the `--cookies` file when it exits, so it must never see the
+/// canonical path. `None` when signed out or the copy fails (the caller
+/// then downloads without cookies). Runs on the backend runtime, never the
+/// UI thread.
+async fn prepare_download_cookies(canonical: Option<&Path>) -> Option<PathBuf> {
+    let src = canonical?;
+    let text = tokio::fs::read_to_string(src).await.ok()?;
+    let tmp = crate::auth::download_cookie_path(
+        src,
+        std::process::id(),
+        DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+    crate::auth::write_cookie_file(&tmp, &text).await.ok()?;
+    Some(tmp)
+}
+
+/// Delete a private download copy after the download returns, on every path.
+async fn cleanup_download_cookies(temp: Option<PathBuf>) {
+    if let Some(path) = temp {
         let _ = tokio::fs::remove_file(path).await;
     }
 }
-
 
 /// Key page loads on rustypipe's own auth state, not on the file on disk.
 fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::RustyPipeQuery {
@@ -423,10 +435,24 @@ impl Backend {
             let cookies: std::sync::Arc<std::sync::RwLock<Option<PathBuf>>> =
                 std::sync::Arc::new(std::sync::RwLock::new(None));
             let cookie_file: Option<PathBuf> = crate::auth::cookie_path();
+            // Delete leftover `cookies.<pid>.<counter>.tmp` copies from
+            // crashed downloads; the canonical `cookies.txt` is untouched.
+            if let Some(path) = &cookie_file
+                && let Some(dir) = path.parent()
+                && let Ok(entries) = std::fs::read_dir(dir)
+            {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if crate::auth::is_download_cookie_leftover(&name) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
             // Signed in only when the cookie file is a regular file AND
-            // rustypipe actually holds a cookie (a yt-dlp download still
-            // running at sign-out rewrites the file when it exits, so the
-            // file alone is not trustworthy). Otherwise delete and start out.
+            // rustypipe actually holds a cookie (downloads get private
+            // copies, never the canonical file, so the file alone is not
+            // trustworthy). Otherwise delete and start out.
             if let Some(path) = &cookie_file {
                 let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
                 let authed = rp.as_ref().is_some_and(|rp| {
@@ -602,7 +628,7 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
-                            Cmd::OpenAlbum(id) => {
+                            Cmd::OpenAlbum(id, generation) => {
                                 if let Some(rp) = rp {
                                     let q = authed_query(&rp);
                                     match q.music_album(&id).await {
@@ -632,8 +658,9 @@ impl Backend {
                                                 .cloned()
                                                 .map(|t| track_from_album_track(t, &album))
                                                 .collect();
-                                            let _ = event_tx.send(Event::Collection(
-                                                Collection {
+                                            let _ = event_tx.send(Event::Collection {
+                                                generation,
+                                                collection: Collection {
                                                     id: album.id,
                                                     title: album.name,
                                                     kind: CardKind::Album,
@@ -641,13 +668,14 @@ impl Backend {
                                                     thumb_url,
                                                     tracks,
                                                 },
-                                            ));
+                                            });
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
                                                 kind: PageKind::Collection,
                                                 error: e.to_string(),
+                                                generation,
                                             });
                                         }
                                     }
@@ -655,11 +683,11 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err, generation });
                                 }
                                 ctx.request_repaint();
                             }
-                            Cmd::OpenPlaylist(id) => {
+                            Cmd::OpenPlaylist(id, generation) => {
                                 if let Some(rp) = rp {
                                     let q = authed_query(&rp);
                                     match q.music_playlist(&id).await {
@@ -691,8 +719,9 @@ impl Backend {
                                                 .into_iter()
                                                 .map(track_from)
                                                 .collect();
-                                            let _ = event_tx.send(Event::Collection(
-                                                Collection {
+                                            let _ = event_tx.send(Event::Collection {
+                                                generation,
+                                                collection: Collection {
                                                     id: playlist.id,
                                                     title: playlist.name,
                                                     kind: CardKind::Playlist,
@@ -700,13 +729,14 @@ impl Backend {
                                                     thumb_url,
                                                     tracks,
                                                 },
-                                            ));
+                                            });
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
                                                 kind: PageKind::Collection,
                                                 error: e.to_string(),
+                                                generation,
                                             });
                                         }
                                     }
@@ -714,11 +744,11 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err, generation });
                                 }
                                 ctx.request_repaint();
                             }
-                            Cmd::OpenArtist(id) => {
+                            Cmd::OpenArtist(id, generation) => {
                                 if let Some(rp) = rp {
                                     let q = authed_query(&rp);
                                     match q.music_artist(&id, false).await {
@@ -734,23 +764,27 @@ impl Backend {
                                                 .collect();
                                             let (albums, singles) =
                                                 split_artist_albums(artist.albums);
-                                            let _ = event_tx.send(Event::Artist(ArtistPage {
-                                                id: artist.id,
-                                                name: artist.name,
-                                                thumb_url,
-                                                subscribers,
-                                                top_songs,
-                                                albums,
-                                                singles,
-                                                radio_id: artist.radio_id,
-                                                tracks_playlist_id: artist.tracks_playlist_id,
-                                            }));
+                                            let _ = event_tx.send(Event::Artist {
+                                                generation,
+                                                artist: ArtistPage {
+                                                    id: artist.id,
+                                                    name: artist.name,
+                                                    thumb_url,
+                                                    subscribers,
+                                                    top_songs,
+                                                    albums,
+                                                    singles,
+                                                    radio_id: artist.radio_id,
+                                                    tracks_playlist_id: artist.tracks_playlist_id,
+                                                },
+                                            });
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(Event::PageError {
                                                 id,
                                                 kind: PageKind::Artist,
                                                 error: e.to_string(),
+                                                generation,
                                             });
                                         }
                                     }
@@ -758,7 +792,7 @@ impl Backend {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err });
+                                    let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err, generation });
                                 }
                                 ctx.request_repaint();
                             }
@@ -1035,9 +1069,11 @@ impl Backend {
                                 ctx.request_repaint();
                             }
                             Cmd::Fetch(track) => {
-                                let cookies_now = cookie_path_now(&cookies);
-                                let used_cookies = cookies_now.is_some();
-                                match crate::audio::fetch(&track.id, cookies_now.as_deref()).await {
+                                let temp = prepare_download_cookies(
+                                    cookie_path_now(&cookies).as_deref(),
+                                )
+                                .await;
+                                match crate::audio::fetch(&track.id, temp.as_deref()).await {
                                     Ok(path) => {
                                         let _ = event_tx.send(Event::Ready {
                                             id: track.id,
@@ -1051,20 +1087,19 @@ impl Backend {
                                         });
                                     }
                                 }
-                                if used_cookies {
-                                    scrub_recreated_cookies(&cookies, cookie_file.as_deref()).await;
-                                }
+                                cleanup_download_cookies(temp).await;
                                 ctx.request_repaint();
                             }
                             Cmd::Prefetch(track) => {
                                 // Warm the cache for the likely-next track. No
                                 // event on success; failures stay silent.
-                                let cookies_now = cookie_path_now(&cookies);
-                                let used_cookies = cookies_now.is_some();
-                                let _ = crate::audio::fetch(&track.id, cookies_now.as_deref()).await;
-                                if used_cookies {
-                                    scrub_recreated_cookies(&cookies, cookie_file.as_deref()).await;
-                                }
+                                let temp = prepare_download_cookies(
+                                    cookie_path_now(&cookies).as_deref(),
+                                )
+                                .await;
+                                let _ =
+                                    crate::audio::fetch(&track.id, temp.as_deref()).await;
+                                cleanup_download_cookies(temp).await;
                                 ctx.request_repaint();
                             }
                         }
@@ -1078,11 +1113,11 @@ impl Backend {
                         Cmd::Search(query) => {
                             let _ = event_tx.send(Event::SearchError { query, error: err });
                         }
-                        Cmd::OpenAlbum(id) | Cmd::OpenPlaylist(id) => {
-                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err });
+                        Cmd::OpenAlbum(id, generation) | Cmd::OpenPlaylist(id, generation) => {
+                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Collection, error: err, generation });
                         }
-                        Cmd::OpenArtist(id) => {
-                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err });
+                        Cmd::OpenArtist(id, generation) => {
+                            let _ = event_tx.send(Event::PageError { id, kind: PageKind::Artist, error: err, generation });
                         }
                         Cmd::Radio(id) => {
                             let _ = event_tx.send(Event::RadioError { id, error: err });

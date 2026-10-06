@@ -65,12 +65,10 @@ impl Settings {
         app.queue_open = self.queue_open;
         // Signed-in state comes from disk + rustypipe, not Settings: a
         // restored private view while signed out would show a broken page.
+        // Album/Artist pages are public, so only Library and Playlist fall
+        // back to Home when signed out.
         let mut view = Self::sanitize_view(self.last_view.clone());
-        let private = matches!(
-            view,
-            View::Library | View::Playlist(_) | View::Album(_) | View::Artist(_)
-        );
-        if private && !stored_cookie_present() {
+        if is_private_view(&view) && !stored_cookie_present() {
             view = View::Home;
         }
         app.nav = Nav::new(view);
@@ -84,6 +82,13 @@ fn stored_cookie_present() -> bool {
     crate::auth::cookie_path().is_some_and(|p| {
         std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
     })
+}
+
+/// Views that require sign-in. Album/Artist pages are public; only Library
+/// and Playlist fall back to Home when signed out (startup restore) or
+/// navigate Home on sign-out.
+fn is_private_view(view: &View) -> bool {
+    matches!(view, View::Library | View::Playlist(_))
 }
 
 /// How long a radio failure notice stays in the player bar before expiring.
@@ -277,6 +282,7 @@ impl App {
         self.is_active_playback = true;
         self.is_loading = true;
         self.fetch_error = None;
+        self.prefetched = None;
         self.radio_error = None;
         self.last_start = Some(LastStart {
             track_id: track.id.clone(),
@@ -352,21 +358,22 @@ impl App {
                 if !self.collections.contains_key(id) && !self.collections_loading.contains(id) {
                     self.collections_loading.insert(id.clone());
                     self.collection_errors.remove(id);
-                    self.backend.send(Cmd::OpenAlbum(id.clone()));
+                    self.backend.send(Cmd::OpenAlbum(id.clone(), self.auth_generation));
                 }
             }
             View::Playlist(id) => {
                 if !self.collections.contains_key(id) && !self.collections_loading.contains(id) {
                     self.collections_loading.insert(id.clone());
                     self.collection_errors.remove(id);
-                    self.backend.send(Cmd::OpenPlaylist(id.clone()));
+                    self.backend
+                        .send(Cmd::OpenPlaylist(id.clone(), self.auth_generation));
                 }
             }
             View::Artist(id) => {
                 if !self.artists.contains_key(id) && !self.artists_loading.contains(id) {
                     self.artists_loading.insert(id.clone());
                     self.artist_errors.remove(id);
-                    self.backend.send(Cmd::OpenArtist(id.clone()));
+                    self.backend.send(Cmd::OpenArtist(id.clone(), self.auth_generation));
                 }
             }
         }
@@ -542,13 +549,10 @@ impl App {
             Action::SignOut => {
                 self.show_user_menu = false;
                 self.auth_generation = self.auth_generation.wrapping_add(1);
-                // Leave private pages so the view is not blank after sign-out.
-                match &self.nav.current {
-                    View::Playlist(_) | View::Album(_) | View::Artist(_) | View::Library => {
-                        self.nav.go(View::Home);
-                        self.ensure_view_loaded(&View::Home);
-                    }
-                    _ => {}
+                // Only private views navigate Home: Album/Artist are public
+                // and stay open (reloaded on sign-out in `Event::Auth`).
+                if is_private_view(&self.nav.current) {
+                    self.nav.go(View::Home);
                 }
                 self.backend.send(Cmd::SignOut);
             }
@@ -580,17 +584,17 @@ impl App {
                 View::Album(id) => {
                     self.collection_errors.remove(&id);
                     self.collections_loading.insert(id.clone());
-                    self.backend.send(Cmd::OpenAlbum(id));
+                    self.backend.send(Cmd::OpenAlbum(id, self.auth_generation));
                 }
                 View::Playlist(id) => {
                     self.collection_errors.remove(&id);
                     self.collections_loading.insert(id.clone());
-                    self.backend.send(Cmd::OpenPlaylist(id));
+                    self.backend.send(Cmd::OpenPlaylist(id, self.auth_generation));
                 }
                 View::Artist(id) => {
                     self.artist_errors.remove(&id);
                     self.artists_loading.insert(id.clone());
-                    self.backend.send(Cmd::OpenArtist(id));
+                    self.backend.send(Cmd::OpenArtist(id, self.auth_generation));
                 }
                 View::Library => {
                     self.library_error = None;
@@ -627,12 +631,18 @@ impl eframe::App for App {
                     self.search_loading.remove(&query);
                     self.search_errors.insert(query, error);
                 }
-                Event::Collection(collection) => {
+                Event::Collection { generation, collection } => {
+                    if generation != self.auth_generation {
+                        continue;
+                    }
                     self.collections_loading.remove(&collection.id);
                     self.collection_errors.remove(&collection.id);
                     self.collections.insert(collection.id.clone(), collection);
                 }
-                Event::Artist(artist) => {
+                Event::Artist { generation, artist } => {
+                    if generation != self.auth_generation {
+                        continue;
+                    }
                     self.artists_loading.remove(&artist.id);
                     self.artist_errors.remove(&artist.id);
                     self.artists.insert(artist.id.clone(), artist);
@@ -663,7 +673,10 @@ impl eframe::App for App {
                     self.radio_pending = None;
                     self.radio_error = Some((format!("Radio failed: {error}"), Instant::now()));
                 }
-                Event::PageError { id, kind, error } => {
+                Event::PageError { id, kind, error, generation } => {
+                    if generation != self.auth_generation {
+                        continue;
+                    }
                     match kind {
                         PageKind::Collection => {
                             self.collections_loading.remove(&id);
@@ -708,13 +721,21 @@ impl eframe::App for App {
                         self.backend.send(Cmd::LoadLibrary(self.auth_generation));
                     } else if error.is_none() {
                         // Clean sign-out (not a failed sign-in): drop library
-                        // and any cached private pages.
+                        // and any cached private pages, then reload the open
+                        // public page (if any) instead of leaving it blank.
                         self.auth_error = None;
                         self.library = None;
                         self.library_loading = false;
                         self.library_error = None;
                         self.collections.clear();
+                        self.collections_loading.clear();
                         self.collection_errors.clear();
+                        self.artists_loading.clear();
+                        self.artist_errors.clear();
+                        self.search_loading.clear();
+                        self.search_errors.clear();
+                        let current = self.nav.current.clone();
+                        self.ensure_view_loaded(&current);
                     } else {
                         self.auth_error = error;
                     }
@@ -939,12 +960,24 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&view).unwrap()).unwrap();
             assert_eq!(v, view);
         }
-
         // Search maps to Home on sanitize
         assert_eq!(
             Settings::sanitize_view(View::Search("x".to_string())),
             View::Home
         );
+    }
+
+    #[test]
+    fn test_private_view_only_library_and_playlist() {
+        // Signed-out fallback (startup restore, sign-out nav) covers only
+        // Library and Playlist: Album/Artist pages are public and stay open.
+        assert!(is_private_view(&View::Library));
+        assert!(is_private_view(&View::Playlist("p".to_string())));
+        assert!(!is_private_view(&View::Home));
+        assert!(!is_private_view(&View::Explore));
+        assert!(!is_private_view(&View::Search("q".to_string())));
+        assert!(!is_private_view(&View::Album("a".to_string())));
+        assert!(!is_private_view(&View::Artist("r".to_string())));
     }
 
     #[test]
