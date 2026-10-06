@@ -64,6 +64,9 @@ impl Settings {
     }
 }
 
+/// How long a radio failure notice stays in the player bar before expiring.
+const RADIO_ERROR_TTL: Duration = Duration::from_secs(5);
+
 /// Last track actually started via `start_track`, for the PlayList
 /// double-click guard: one gesture starts playback once, so the second
 /// PlayList of a double-click (same track, same list shape, < 500 ms after
@@ -76,13 +79,16 @@ struct LastStart {
     at: Instant,
 }
 
-/// Second half of a double-click? Same track id, same list shape, within
-/// the double-click window. Pure so it is unit-testable.
+/// Second half of a double-click? Same track id, same list shape, same (or
+/// unspecified) shuffle, within the double-click window. Pure so it is
+/// unit-testable.
 fn is_double_click_repeat(
     last: Option<&LastStart>,
     track_id: &str,
     list_len: usize,
     start: usize,
+    shuffle: Option<bool>,
+    current_shuffle: bool,
     now: Instant,
 ) -> bool {
     match last {
@@ -90,6 +96,9 @@ fn is_double_click_repeat(
             l.track_id == track_id
                 && l.list_len == list_len
                 && l.start == start
+                // Play (Some(false)) then Shuffle (Some(true)) on the same
+                // list is a new request, not a double-click echo.
+                && (shuffle.is_none() || shuffle == Some(current_shuffle))
                 && now.duration_since(l.at) < Duration::from_millis(500)
         }
         None => false,
@@ -141,6 +150,11 @@ pub struct App {
     pub queue_open: bool,
     pub prefetched: Option<String>,
     pub radio_pending: Option<String>,
+    /// Transient radio failure notice with its timestamp: shown in the
+    /// player bar but auto-expires after `RADIO_ERROR_TTL` so it never
+    /// masquerades as the current track's error. Real fetch errors of the
+    /// current track stay in `fetch_error` and do not expire.
+    pub radio_error: Option<(String, Instant)>,
     /// Last track actually started, for the PlayList double-click guard.
     last_start: Option<LastStart>,
     pub now_playing: Option<fastframe_now_playing::NowPlaying>,
@@ -184,6 +198,7 @@ impl App {
             queue_open: false,
             prefetched: None,
             radio_pending: None,
+            radio_error: None,
             last_start: None,
             now_playing: None,
             home: None,
@@ -215,6 +230,17 @@ impl App {
             at: Instant::now(),
         });
         self.backend.send(Cmd::Fetch(track));
+    }
+
+    /// Error line for the player bar: a real fetch error of the current
+    /// track wins; an unexpired radio failure shows only when there is none.
+    pub fn player_error(&self) -> Option<&str> {
+        if let Some(err) = &self.fetch_error {
+            return Some(err);
+        }
+        self.radio_error.as_ref().and_then(|(msg, at)| {
+            (at.elapsed() < RADIO_ERROR_TTL).then_some(msg.as_str())
+        })
     }
 
     /// Send Prefetch for the likely-next track, at most once per id.
@@ -292,13 +318,16 @@ impl App {
                 shuffle,
             } => {
                 // One gesture starts playback once: swallow only the second
-                // half of a double-click (same track, same list shape, fast).
+                // half of a double-click (same track, same list shape, same
+                // or unspecified shuffle, fast).
                 let is_dbl = match tracks.get(start) {
                     Some(t) => is_double_click_repeat(
                         self.last_start.as_ref(),
                         &t.id,
                         tracks.len(),
-                        start.min(tracks.len().saturating_sub(1)),
+                        start,
+                        shuffle,
+                        self.queue.shuffle,
                         Instant::now(),
                     ),
                     None => false,
@@ -306,6 +335,9 @@ impl App {
                 if is_dbl {
                     return;
                 }
+                // A fresh explicit Play/Shuffle/Jump wins over a late radio
+                // result: it must never replace the list the user started.
+                self.radio_pending = None;
                 let prev_repeat = self.queue.repeat;
                 let prev_shuffle = match shuffle {
                     Some(s) => s,
@@ -427,6 +459,7 @@ impl App {
                     return;
                 }
                 self.radio_pending = Some(video_id.clone());
+                self.radio_error = None;
                 self.backend.send(Cmd::Radio(video_id));
             }
             Action::Retry(view) => match view {
@@ -502,7 +535,8 @@ impl eframe::App for App {
                     }
                     self.radio_pending = None;
                     if tracks.is_empty() {
-                        self.fetch_error = Some("Radio returned no tracks".to_string());
+                        self.radio_error =
+                            Some(("Radio returned no tracks".to_string(), Instant::now()));
                     } else {
                         let prev_repeat = self.queue.repeat;
                         let prev_shuffle = self.queue.shuffle;
@@ -519,7 +553,7 @@ impl eframe::App for App {
                         continue;
                     }
                     self.radio_pending = None;
-                    self.fetch_error = Some(format!("Radio failed: {error}"));
+                    self.radio_error = Some((format!("Radio failed: {error}"), Instant::now()));
                 }
                 Event::PageError { id, kind, error } => {
                     match kind {
@@ -554,6 +588,18 @@ impl eframe::App for App {
                         self.fetch_error = Some(msg);
                     }
                 }
+            }
+        }
+
+        // Radio failure notices are transient: expire them so the player
+        // bar falls back to the current track's artist/album line. Fetch
+        // errors of the current track (`fetch_error`) never expire.
+        if let Some((_, at)) = &self.radio_error {
+            let age = at.elapsed();
+            if age >= RADIO_ERROR_TTL {
+                self.radio_error = None;
+            } else {
+                ctx.request_repaint_after(RADIO_ERROR_TTL - age);
             }
         }
 
@@ -874,11 +920,14 @@ mod tests {
             at: t0,
         };
         // Second click of a double-click: same track, same list, fast.
+        // `shuffle: None` (row double-click) echoes the current mode.
         assert!(is_double_click_repeat(
             Some(&last),
             "t1",
             10,
             3,
+            None,
+            false,
             t0 + Duration::from_millis(100),
         ));
         // Replay after the queue ended (repeat off): seconds later, not
@@ -888,6 +937,8 @@ mod tests {
             "t1",
             10,
             3,
+            None,
+            false,
             t0 + Duration::from_secs(30),
         ));
         // Retry after FetchError / play_file error: same track, but the
@@ -897,6 +948,8 @@ mod tests {
             "t1",
             10,
             3,
+            None,
+            false,
             t0 + Duration::from_secs(5),
         ));
         // Different list whose start track equals the current one:
@@ -906,6 +959,8 @@ mod tests {
             "t1",
             4,
             0,
+            None,
+            false,
             t0 + Duration::from_millis(100),
         ));
         // Same length but different start index — must go through.
@@ -914,6 +969,8 @@ mod tests {
             "t1",
             10,
             5,
+            None,
+            false,
             t0 + Duration::from_millis(100),
         ));
         // Different track id — must go through.
@@ -922,10 +979,51 @@ mod tests {
             "t2",
             10,
             3,
+            None,
+            false,
             t0 + Duration::from_millis(100),
         ));
         // No previous start — must go through.
-        assert!(!is_double_click_repeat(None, "t1", 10, 3, t0));
+        assert!(!is_double_click_repeat(
+            None, "t1", 10, 3, None, false, t0
+        ));
+        // Collection Play (shuffle off) then Shuffle on the same list:
+        // a new request, not a double-click echo — must go through.
+        let play_last = LastStart {
+            track_id: "t1".to_string(),
+            list_len: 4,
+            start: 0,
+            at: t0,
+        };
+        assert!(!is_double_click_repeat(
+            Some(&play_last),
+            "t1",
+            4,
+            0,
+            Some(true),
+            false,
+            t0 + Duration::from_millis(100),
+        ));
+        // And vice versa: Shuffle then Play (shuffle off) goes through.
+        assert!(!is_double_click_repeat(
+            Some(&play_last),
+            "t1",
+            4,
+            0,
+            Some(false),
+            true,
+            t0 + Duration::from_millis(100),
+        ));
+        // Same shuffle mode re-requested fast is still a double-click echo.
+        assert!(is_double_click_repeat(
+            Some(&play_last),
+            "t1",
+            4,
+            0,
+            Some(false),
+            false,
+            t0 + Duration::from_millis(100),
+        ));
         // ponytail: a different list with the SAME length and SAME start
         // index and same first track id inside 500 ms is indistinguishable
         // from a double-click and is swallowed. Cheap to accept: it needs
