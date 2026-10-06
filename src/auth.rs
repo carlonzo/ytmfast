@@ -1,3 +1,4 @@
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::backend::{Card, CardKind, Track};
@@ -6,14 +7,16 @@ use crate::backend::{Card, CardKind, Track};
 /// passed as an argv element, never through a shell.
 pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome"];
 
+/// Reject user-typed cookie files larger than this (checked via metadata first).
+pub const MAX_COOKIE_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Max history tracks kept on the Listen again shelf.
 pub const HISTORY_CAP: usize = 20;
 
 /// `<config_dir>/ytmfast/cookies.txt`, e.g. `~/.config/ytmfast/cookies.txt`.
-pub fn cookie_path() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| b.config_dir().join("ytmfast").join("cookies.txt"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/ytmfast-cookies.txt"))
+/// `None` when there is no config dir (never fall back to a world-writable dir).
+pub fn cookie_path() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.config_dir().join("ytmfast").join("cookies.txt"))
 }
 
 /// True iff the browser name is in the fixed allowlist (exact match).
@@ -38,6 +41,107 @@ pub fn import_args(browser: &str, out: &Path) -> Option<Vec<String>> {
         "--no-warnings".to_string(),
         "https://music.youtube.com".to_string(),
     ])
+}
+
+/// True for `youtube.com`/`.youtube.com` or `google.com`/`.google.com`
+/// or a subdomain of either. Input is the raw Netscape domain field
+/// (leading dot optional, case-insensitive).
+fn keep_domain(domain: &str) -> bool {
+    let d = domain.trim().trim_start_matches('.').to_lowercase();
+    d == "youtube.com"
+        || d == "google.com"
+        || d.ends_with(".youtube.com")
+        || d.ends_with(".google.com")
+}
+
+/// Keep only comment/header lines and cookie lines for youtube/google
+/// domains. Netscape format: 7 tab-separated fields, domain is field 0;
+/// `#HttpOnly_`-prefixed lines are cookie lines (prefix preserved).
+/// Malformed or off-domain lines are dropped. Result ends with a trailing
+/// newline when non-empty.
+pub fn filter_cookies(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("#HttpOnly_") {
+            let mut cols = rest.split('\t');
+            let keep = matches!(cols.next(), Some(d) if keep_domain(d))
+                && rest.split('\t').count() == 7;
+            if keep {
+                out.push_str(line);
+                out.push('\n');
+            }
+        } else if line.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+        } else if line.trim().is_empty() {
+            continue;
+        } else {
+            let mut cols = line.split('\t');
+            let keep = matches!(cols.next(), Some(d) if keep_domain(d))
+                && line.split('\t').count() == 7;
+            if keep {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Remove any existing file, then create with mode 0600 (`create_new`),
+/// write, and re-assert 0600. Never logs cookie contents.
+pub fn write_cookie_file_sync(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create config dir: {e}"))?;
+    }
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let mut file = opts.open(path).map_err(|e| format!("Cannot create cookie file: {e}"))?;
+    {
+        use std::io::Write;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("Cannot write cookie file: {e}"))?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Cannot secure cookie file: {e}"))?;
+    Ok(())
+}
+
+/// Async wrapper for backend use: same 0600 guarantees, off the async
+/// executor via `spawn_blocking` so the UI thread never blocks.
+pub async fn write_cookie_file(path: &Path, contents: &str) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let contents = contents.to_string();
+    tokio::task::spawn_blocking(move || write_cookie_file_sync(&path, &contents))
+        .await
+        .map_err(|e| format!("Cookie write task failed: {e}"))?
+}
+
+/// Expand a leading `~/` to the home dir. Returns the input unchanged
+/// when there is no `~` prefix or no home dir.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// Validate the user-typed cookie file path: expand `~/`, require a
+/// regular file, reject files over [`MAX_COOKIE_FILE_BYTES`] via metadata
+/// before reading. Returns the resolved path.
+pub fn resolve_user_cookie_file(path: &str) -> Result<PathBuf, String> {
+    let resolved = expand_tilde(path.trim());
+    let meta = std::fs::metadata(&resolved).map_err(|e| format!("Cannot read cookie file: {e}"))?;
+    if !meta.is_file() {
+        return Err("Not a regular file".to_string());
+    }
+    if meta.len() > MAX_COOKIE_FILE_BYTES {
+        return Err("Cookie file too large (max 1 MiB)".to_string());
+    }
+    Ok(resolved)
 }
 
 /// Dedupe history tracks by id (keep first occurrence order), cap at
@@ -135,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_cookie_path_ends_with_your_config() {
-        let p = cookie_path();
+        let Some(p) = cookie_path() else { return };
         assert_eq!(
             p.file_name().and_then(|n| n.to_str()),
             Some("cookies.txt")
@@ -190,5 +294,75 @@ mod tests {
         let s = short_error(&long);
         assert_eq!(s.chars().count(), 201);
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn test_filter_cookies_keeps_youtube_google_only() {
+        let line = |d: &str, name: &str| format!("{d}\tTRUE\t/\tTRUE\t0\t{name}\tval");
+        let text = format!(
+            "# Netscape HTTP Cookie File\n#HttpOnly_{}\n{}\n{}\n{}\nbadline\n{}\n",
+            line(".youtube.com", "SID"),
+            line(".google.com", "SSID"),
+            line("music.youtube.com", "HSID"),
+            line(".example.com", "evil"),
+            line(".youtube.com", "short")
+        );
+        let text = text.replacen("short\tval", "short", 1);
+        let filtered = filter_cookies(&text);
+        assert!(filtered.contains("# Netscape HTTP Cookie File"));
+        assert!(filtered.contains("#HttpOnly_.youtube.com\tTRUE"));
+        assert!(filtered.contains(".google.com\tTRUE"));
+        assert!(filtered.contains("music.youtube.com\tTRUE"));
+        assert!(!filtered.contains("example.com"));
+        assert!(!filtered.contains("badline"));
+        assert!(!filtered.contains("short"));
+        assert!(filtered.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_filter_cookies_case_and_dot_insensitive() {
+        let text = ".YOUTUBE.COM\tTRUE\t/\tTRUE\t0\tA\t1\n\
+            youtube.com\tTRUE\t/\tTRUE\t0\tB\t2\n\
+            .GOOGLE.COM\tTRUE\t/\tTRUE\t0\tC\t3\n\
+            .fakegoogle.com\tTRUE\t/\tTRUE\t0\tD\t4\n";
+        let filtered = filter_cookies(text);
+        assert!(filtered.contains(".YOUTUBE.COM"));
+        assert!(filtered.contains("youtube.com\tTRUE"));
+        assert!(filtered.contains(".GOOGLE.COM"));
+        assert!(!filtered.contains("fakegoogle"));
+    }
+
+    #[test]
+    fn test_expand_tilde_and_resolve_size_cap() {
+        let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+        if let Some(home) = home {
+            assert_eq!(expand_tilde("~/a/b"), home.join("a/b"));
+        }
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path"), PathBuf::from("rel/path"));
+        // Missing file errors, does not read.
+        assert!(resolve_user_cookie_file("/nonexistent-ytmfast-cookies.txt").is_err());
+        // Directory is not a regular file.
+        let dir = std::env::temp_dir();
+        assert!(resolve_user_cookie_file(dir.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_write_cookie_file_sync_creates_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ytmfast-test-{}", std::process::id()));
+        let path = dir.join("cookies.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Pre-existing 0644 file must be replaced with 0600.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_cookie_file_sync(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

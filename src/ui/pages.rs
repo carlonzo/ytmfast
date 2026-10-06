@@ -36,6 +36,7 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
         draw_home_library_shelves(ui, app, actions);
     }
 
+    // 1. Top songs: 4-row grid of compact song rows
     if !home.top_songs.is_empty() {
         ui.label(
             egui::RichText::new("Top songs")

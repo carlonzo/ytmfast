@@ -345,30 +345,14 @@ fn cookie_path_now(cookies: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathB
     cookies.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Create parent dir + empty 0600 file BEFORE content lands, then re-assert
-/// 0600 after writing. Never logs cookie contents.
-async fn write_cookie_file(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("Cannot create config dir: {e}"))?;
+/// Key page loads on rustypipe's own auth state, not on the file on disk.
+fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::RustyPipeQuery {
+    let q = rp.query();
+    if q.auth_enabled(rustypipe::client::ClientType::DesktopMusic) {
+        q.authenticated()
+    } else {
+        q
     }
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .await
-        .map_err(|e| format!("Cannot create cookie file: {e}"))?;
-    drop(file);
-    tokio::fs::write(path, contents)
-        .await
-        .map_err(|e| format!("Cannot write cookie file: {e}"))?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .map_err(|e| format!("Cannot secure cookie file: {e}"))?;
-    Ok(())
 }
 
 async fn fail_auth(
@@ -416,14 +400,24 @@ impl Backend {
             };
             let cookies: std::sync::Arc<std::sync::RwLock<Option<PathBuf>>> =
                 std::sync::Arc::new(std::sync::RwLock::new(None));
-            let cookie_file = crate::auth::cookie_path();
-            // Signed-in state is derived from the cookie file on disk:
-            // rustypipe persisted its cookie in storage_dir, so if our file
-            // survived, the session is still usable.
-            if cookie_file.is_file() {
-                *cookies.write().unwrap_or_else(|e| e.into_inner()) =
-                    Some(cookie_file.clone());
-                let _ = event_tx.send(Event::Auth { signed_in: true, error: None });
+            let cookie_file: Option<PathBuf> = crate::auth::cookie_path();
+            // Signed in only when the cookie file is a regular file AND
+            // rustypipe actually holds a cookie (a yt-dlp download still
+            // running at sign-out rewrites the file when it exits, so the
+            // file alone is not trustworthy). Otherwise delete and start out.
+            if let Some(path) = &cookie_file {
+                let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+                let authed = rp.as_ref().is_some_and(|rp| {
+                    rp.query().auth_enabled(rustypipe::client::ClientType::DesktopMusic)
+                });
+                if regular && authed {
+                    let _ =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    *cookies.write().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+                    let _ = event_tx.send(Event::Auth { signed_in: true, error: None });
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
             }
 
             let _guard = rt.as_ref().map(|r| r.enter());
@@ -433,6 +427,7 @@ impl Backend {
                 let rp = rp.clone();
                 let rp_err = rp_err.clone();
                 let rt_err = rt_err.clone();
+
                 let cookies = cookies.clone();
                 let cookie_file = cookie_file.clone();
                 if let Some(rt_ref) = &rt {
@@ -578,10 +573,7 @@ impl Backend {
                             }
                             Cmd::OpenAlbum(id) => {
                                 if let Some(rp) = rp {
-                                    let mut q = rp.query();
-                                    if cookie_path_now(&cookies).is_some() {
-                                        q = q.authenticated();
-                                    }
+                                    let q = authed_query(&rp);
                                     match q.music_album(&id).await {
                                         Ok(album) => {
                                             let total_secs: u32 = album
@@ -637,10 +629,7 @@ impl Backend {
                             }
                             Cmd::OpenPlaylist(id) => {
                                 if let Some(rp) = rp {
-                                    let mut q = rp.query();
-                                    if cookie_path_now(&cookies).is_some() {
-                                        q = q.authenticated();
-                                    }
+                                    let q = authed_query(&rp);
                                     match q.music_playlist(&id).await {
                                         Ok(playlist) => {
                                             let total_secs: u32 = playlist
@@ -698,10 +687,7 @@ impl Backend {
                             }
                             Cmd::OpenArtist(id) => {
                                 if let Some(rp) = rp {
-                                    let mut q = rp.query();
-                                    if cookie_path_now(&cookies).is_some() {
-                                        q = q.authenticated();
-                                    }
+                                    let q = authed_query(&rp);
                                     match q.music_artist(&id, false).await {
                                         Ok(artist) => {
                                             let thumb_url =
@@ -775,55 +761,80 @@ impl Backend {
                                             .clone()
                                             .unwrap_or_else(|| "RustyPipe init failed".to_string())
                                     })?;
+                                    let cookie_file = cookie_file.as_ref().ok_or_else(|| {
+                                        "No config dir: cannot store cookies".to_string()
+                                    })?;
                                     match source {
                                         SignInSource::Browser(browser) => {
                                             let args =
-                                                crate::auth::import_args(&browser, &cookie_file)
+                                                crate::auth::import_args(&browser, cookie_file)
                                                     .ok_or_else(|| {
                                                         format!("Unsupported browser: {browser}")
                                                     })?;
                                             // 0600 placeholder BEFORE content lands.
-                                            write_cookie_file(&cookie_file, "").await?;
+                                            crate::auth::write_cookie_file(cookie_file, "").await?;
                                             let out = tokio::time::timeout(
                                                 Duration::from_secs(60),
                                                 tokio::process::Command::new("yt-dlp")
                                                     .args(&args)
+                                                    .kill_on_drop(true)
                                                     .output(),
                                             )
                                             .await
                                             .map_err(|_| "Browser import timed out".to_string())?
                                             .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
-                                            if !out.status.success() {
-                                                let stderr =
-                                                    String::from_utf8_lossy(&out.stderr);
+                                            // yt-dlp exits 1 on the probe URL ("Unsupported
+                                            // URL") but still saves the jar on close: do NOT
+                                            // gate on exit status. Only the file counts.
+                                            let bytes = tokio::fs::read(cookie_file).await.map_err(
+                                                |_| {
+                                                    format!(
+                                                        "Browser import failed: {}",
+                                                        crate::auth::short_error(
+                                                            &String::from_utf8_lossy(&out.stderr)
+                                                        )
+                                                    )
+                                                },
+                                            )?;
+                                            if bytes.is_empty() {
                                                 return Err(format!(
                                                     "Browser import failed: {}",
-                                                    crate::auth::short_error(&stderr)
+                                                    crate::auth::short_error(
+                                                        &String::from_utf8_lossy(&out.stderr)
+                                                    )
                                                 ));
                                             }
-                                            tokio::fs::set_permissions(
-                                                &cookie_file,
-                                                std::fs::Permissions::from_mode(0o600),
-                                            )
-                                            .await
-                                            .map_err(|e| {
-                                                format!("Cannot secure cookie file: {e}")
-                                            })?;
                                         }
                                         SignInSource::File(path) => {
-                                            let contents = tokio::fs::read_to_string(&path)
+                                            let src = tokio::task::spawn_blocking(move || {
+                                                crate::auth::resolve_user_cookie_file(
+                                                    &path.to_string_lossy(),
+                                                )
+                                            })
+                                            .await
+                                            .map_err(|e| {
+                                                format!("Cookie check task failed: {e}")
+                                            })??;
+                                            let contents = tokio::fs::read_to_string(&src)
                                                 .await
                                                 .map_err(|e| {
                                                     format!("Cannot read cookie file: {e}")
                                                 })?;
-                                            write_cookie_file(&cookie_file, &contents).await?;
+                                            let filtered =
+                                                crate::auth::filter_cookies(&contents);
+                                            crate::auth::write_cookie_file(cookie_file, &filtered)
+                                                .await?;
                                         }
                                     }
-                                    let txt = tokio::fs::read_to_string(&cookie_file)
+                                    let raw = tokio::fs::read_to_string(cookie_file)
                                         .await
                                         .map_err(|e| format!("Cannot read cookie file: {e}"))?;
+                                    // Drop every non-youtube/google cookie, persist the
+                                    // filtered jar 0600, and feed the FILTERED text.
+                                    let filtered = crate::auth::filter_cookies(&raw);
+                                    crate::auth::write_cookie_file(cookie_file, &filtered).await?;
                                     rp_ref
-                                        .user_auth_set_cookie_txt(&txt)
+                                        .user_auth_set_cookie_txt(&filtered)
                                         .await
                                         .map_err(|e| format!("Invalid cookies: {e}"))?;
                                     rp_ref
@@ -835,29 +846,41 @@ impl Backend {
                                 .await;
                                 match result {
                                     Ok(()) => {
-                                        *cookies.write().unwrap_or_else(|e| e.into_inner()) =
-                                            Some(cookie_file.clone());
+                                        if let Some(cookie_file) = &cookie_file {
+                                            *cookies.write().unwrap_or_else(|e| e.into_inner()) =
+                                                Some(cookie_file.clone());
+                                        }
                                         let _ = event_tx.send(Event::Auth {
                                             signed_in: true,
                                             error: None,
                                         });
                                     }
                                     Err(error) => {
-                                        fail_auth(
-                                            &event_tx,
-                                            &ctx,
-                                            rp.as_ref(),
-                                            &cookies,
-                                            &cookie_file,
-                                            error,
-                                        )
-                                        .await;
+                                        if let Some(cookie_file) = &cookie_file {
+                                            fail_auth(
+                                                &event_tx,
+                                                &ctx,
+                                                rp.as_ref(),
+                                                &cookies,
+                                                cookie_file,
+                                                error,
+                                            )
+                                            .await;
+                                        } else {
+                                            let _ = event_tx.send(Event::Auth {
+                                                signed_in: false,
+                                                error: Some(error),
+                                            });
+                                            ctx.request_repaint();
+                                        }
                                     }
                                 }
                                 ctx.request_repaint();
                             }
                             Cmd::SignOut => {
-                                let _ = tokio::fs::remove_file(&cookie_file).await;
+                                if let Some(cookie_file) = &cookie_file {
+                                    let _ = tokio::fs::remove_file(cookie_file).await;
+                                }
                                 if let Some(rp) = &rp {
                                     let _ = rp.user_auth_remove_cookie().await;
                                 }

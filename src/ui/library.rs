@@ -160,7 +160,7 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for track in lib.history.iter().take(20) {
+                    for (idx, track) in lib.history.iter().take(20).enumerate() {
                         let (rect, resp) = ui.allocate_exact_size(
                             egui::vec2(160.0, 210.0),
                             egui::Sense::click(),
@@ -172,12 +172,7 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
                                 COLOR_SURFACE,
                             );
                         }
-                        if resp.clicked() || resp.double_clicked() {
-                            let idx = lib
-                                .history
-                                .iter()
-                                .position(|t| t.id == track.id)
-                                .unwrap_or(0);
+                        if resp.clicked() {
                             actions.push(Action::PlayList {
                                 tracks: lib.history.clone(),
                                 start: idx,
@@ -203,6 +198,7 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
                                         egui::CornerRadius::same(4),
                                         egui::Color32::from_rgb(0x30, 0x30, 0x30),
                                     );
+                                    ui.allocate_rect(art, egui::Sense::hover());
                                 }
                                 ui.add_space(8.0);
                                 let title_col = if current_id == Some(track.id.as_str()) {
@@ -210,16 +206,24 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
                                 } else {
                                     COLOR_TEXT_PRIMARY
                                 };
-                                ui.label(
-                                    egui::RichText::new(&track.title)
-                                        .color(title_col)
-                                        .strong()
-                                        .size(14.0),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&track.title)
+                                            .color(title_col)
+                                            .strong()
+                                            .size(14.0),
+                                    )
+                                    .truncate()
+                                    .selectable(false),
                                 );
-                                ui.label(
-                                    egui::RichText::new(&track.artist)
-                                        .color(COLOR_TEXT_SECONDARY)
-                                        .size(12.0),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&track.artist)
+                                            .color(COLOR_TEXT_SECONDARY)
+                                            .size(12.0),
+                                    )
+                                    .truncate()
+                                    .selectable(false),
                                 );
                             });
                         });

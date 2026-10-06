@@ -249,8 +249,10 @@ impl App {
                 self.show_user_menu = false;
             }
             Action::HideSignIn => {
+                // A sign-in may still be running on the backend; keep
+                // `sign_in_busy` so the buttons stay disabled and no second
+                // import can start. Only `Event::Auth` clears it.
                 self.show_sign_in = false;
-                self.sign_in_busy = false;
             }
             Action::SignInBrowser(browser) => {
                 self.sign_in_busy = true;
@@ -264,6 +266,14 @@ impl App {
             }
             Action::SignOut => {
                 self.show_user_menu = false;
+                // Leave private pages so the view is not blank after sign-out.
+                match &self.nav.current {
+                    View::Playlist(_) | View::Album(_) | View::Artist(_) | View::Library => {
+                        self.nav.go(View::Home);
+                        self.ensure_view_loaded(&View::Home);
+                    }
+                    _ => {}
+                }
                 self.backend.send(Cmd::SignOut);
             }
             Action::ToggleUserMenu => {
@@ -391,14 +401,12 @@ impl eframe::App for App {
                         self.library_loading = true;
                         self.library_error = None;
                         self.backend.send(Cmd::LoadLibrary);
-                        self.home_loading = true;
-                        self.home_error = None;
-                        self.backend.send(Cmd::LoadHome);
                     } else if error.is_none() {
                         // Clean sign-out (not a failed sign-in): drop library
                         // and any cached private pages.
                         self.auth_error = None;
                         self.library = None;
+                        self.library_loading = false;
                         self.library_error = None;
                         self.collections.clear();
                         self.collection_errors.clear();
@@ -407,11 +415,17 @@ impl eframe::App for App {
                     }
                 }
                 Event::Library(lib) => {
+                    if !self.signed_in {
+                        continue;
+                    }
                     self.library_loading = false;
                     self.library_error = None;
                     self.library = Some(lib);
                 }
                 Event::LibraryError(err) => {
+                    if !self.signed_in {
+                        continue;
+                    }
                     self.library_loading = false;
                     self.library_error = Some(err);
                 }

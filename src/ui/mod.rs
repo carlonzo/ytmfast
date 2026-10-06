@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::audio::Repeat;
 use crate::backend::{Card, CardKind, Track};
 use crate::App;
+
 pub use library::*;
 pub use pages::*;
 
@@ -305,11 +306,12 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                         )
                         .fill(COLOR_SURFACE)
                         .corner_radius(16);
-                        if ui.add(avatar).clicked() {
+                        let avatar_clicked = ui.add(avatar).clicked();
+                        if avatar_clicked {
                             actions.push(Action::ToggleUserMenu);
                         }
-                        if app.show_user_menu {
-                            egui::Area::new(egui::Id::new("user_menu"))
+                        if app.show_user_menu && !avatar_clicked {
+                            let menu_resp = egui::Area::new(egui::Id::new("user_menu"))
                                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 56.0))
                                 .show(ui.ctx(), |ui| {
                                     egui::Frame::new()
@@ -322,6 +324,14 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                                             }
                                         });
                                 });
+                            let clicked_outside = ui.input(|i| i.pointer.any_pressed())
+                                && !menu_resp.response.rect.contains(
+                                    ui.input(|i| i.pointer.press_origin().unwrap_or_default()),
+                                );
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) || clicked_outside
+                            {
+                                actions.push(Action::ToggleUserMenu);
+                            }
                         }
                     } else {
                         let sign_in_btn = egui::Button::image_and_text(
@@ -465,8 +475,7 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for pl in &lib.playlists {
-                                    let is_active =
-                                        app.nav.current == View::Playlist(pl.id.clone());
+                                    let is_active = matches!(&app.nav.current, View::Playlist(id) if *id == pl.id);
                                     let (rect, resp) = ui.allocate_exact_size(
                                         egui::vec2(width - 20.0, 32.0),
                                         egui::Sense::click(),
@@ -483,14 +492,18 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                                         |ui| {
                                             ui.horizontal_centered(|ui| {
                                                 ui.add_space(12.0);
-                                                ui.label(
-                                                    egui::RichText::new(&pl.title)
-                                                        .color(if is_active {
-                                                            COLOR_TEXT_PRIMARY
-                                                        } else {
-                                                            COLOR_TEXT_SECONDARY
-                                                        })
-                                                        .size(13.0),
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&pl.title)
+                                                            .color(if is_active {
+                                                                COLOR_TEXT_PRIMARY
+                                                            } else {
+                                                                COLOR_TEXT_SECONDARY
+                                                            })
+                                                            .size(13.0),
+                                                    )
+                                                    .truncate()
+                                                    .selectable(false),
                                                 );
                                             });
                                         },
@@ -788,16 +801,24 @@ pub fn draw_card(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<Action>) {
             }
 
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(&card.title)
-                    .color(COLOR_TEXT_PRIMARY)
-                    .strong()
-                    .size(14.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&card.title)
+                        .color(COLOR_TEXT_PRIMARY)
+                        .strong()
+                        .size(14.0),
+                )
+                .truncate()
+                .selectable(false),
             );
-            ui.label(
-                egui::RichText::new(&card.subtitle)
-                    .color(COLOR_TEXT_SECONDARY)
-                    .size(12.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&card.subtitle)
+                        .color(COLOR_TEXT_SECONDARY)
+                        .size(12.0),
+                )
+                .truncate()
+                .selectable(false),
             );
         });
     });
