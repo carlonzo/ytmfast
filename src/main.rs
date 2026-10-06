@@ -18,7 +18,6 @@ pub struct App {
     pub is_loading: bool,
     pub search_error: Option<String>,
     pub fetch_error: Option<String>,
-    pub search_focused: bool,
     pub is_active_playback: bool,
 }
 
@@ -38,7 +37,6 @@ impl App {
             is_loading: false,
             search_error: None,
             fetch_error,
-            search_focused: false,
             is_active_playback: false,
         }
     }

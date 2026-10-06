@@ -73,8 +73,6 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                     })
                     .inner;
 
-                app.search_focused = response.has_focus();
-
                 let enter_pressed = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let lost_focus_with_enter =
                     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));

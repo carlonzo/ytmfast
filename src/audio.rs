@@ -189,63 +189,80 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     }
 
     let parent = final_path.parent().ok_or("Invalid cache path")?;
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_path = parent.join(format!("{id}.{}-{n}.dl.m4a", std::process::id()));
-    cleanup_temp(&temp_path).await;
 
-    let args = ytdlp_args(id, &temp_path, cookies);
-    let output_res = tokio::process::Command::new("yt-dlp")
-        .args(&args)
-        .output()
-        .await;
+    for attempt in 0..2 {
+        if final_path.exists() {
+            return Ok(final_path);
+        }
 
-    if final_path.exists() {
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!("{id}.{}-{n}.dl.m4a", std::process::id()));
         cleanup_temp(&temp_path).await;
-        return Ok(final_path);
-    }
 
-    let output = match output_res {
-        Ok(o) => o,
-        Err(e) => {
+        let args = ytdlp_args(id, &temp_path, cookies);
+        let output_res = tokio::process::Command::new("yt-dlp")
+            .args(&args)
+            .output()
+            .await;
+
+        if final_path.exists() {
+            cleanup_temp(&temp_path).await;
+            return Ok(final_path);
+        }
+
+        let output = match output_res {
+            Ok(o) => o,
+            Err(e) => {
+                cleanup_temp(&temp_path).await;
+                if final_path.exists() {
+                    return Ok(final_path);
+                }
+                return Err(format!("Failed to run yt-dlp: {e}"));
+            }
+        };
+
+        if !output.status.success() {
             cleanup_temp(&temp_path).await;
             if final_path.exists() {
                 return Ok(final_path);
             }
-            return Err(format!("Failed to run yt-dlp: {e}"));
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = stderr.lines().take(5).collect::<Vec<_>>().join(" ");
+            return Err(format!(
+                "yt-dlp failed ({}): {}",
+                output.status,
+                if msg.is_empty() { "unknown error" } else { &msg }
+            ));
         }
-    };
 
-    if !output.status.success() {
-        cleanup_temp(&temp_path).await;
-        if final_path.exists() {
-            return Ok(final_path);
+        if !temp_path.exists() {
+            cleanup_temp(&temp_path).await;
+            if final_path.exists() {
+                return Ok(final_path);
+            }
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            return Err("yt-dlp completed but output file not found".to_string());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = stderr.lines().take(5).collect::<Vec<_>>().join(" ");
-        return Err(format!(
-            "yt-dlp failed ({}): {}",
-            output.status,
-            if msg.is_empty() { "unknown error" } else { &msg }
-        ));
+
+        if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+            cleanup_temp(&temp_path).await;
+            if final_path.exists() {
+                return Ok(final_path);
+            }
+            return Err(format!("Failed to save cached audio: {e}"));
+        }
+
+        return Ok(final_path);
     }
 
-    if !temp_path.exists() {
-        cleanup_temp(&temp_path).await;
-        if final_path.exists() {
-            return Ok(final_path);
-        }
-        return Err("yt-dlp completed but output file not found".to_string());
-    }
-
-    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
-        cleanup_temp(&temp_path).await;
-        if final_path.exists() {
-            return Ok(final_path);
-        }
-        return Err(format!("Failed to save cached audio: {e}"));
-    }
-
-    Ok(final_path)
+    unreachable!()
 }
 
 pub struct Player {
