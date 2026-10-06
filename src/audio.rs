@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use crate::backend::Track;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
@@ -119,15 +122,10 @@ impl Queue {
                 .collect();
             shuffle_slice(&mut others);
             let mut new_order = Vec::with_capacity(self.tracks.len());
-            let mut other_iter = others.into_iter();
-            for i in 0..self.tracks.len() {
-                if i == self.pos {
-                    new_order.push(current_track_idx);
-                } else {
-                    new_order.push(other_iter.next().unwrap());
-                }
-            }
+            new_order.push(current_track_idx);
+            new_order.extend(others);
             self.order = new_order;
+            self.pos = 0;
         } else {
             self.order = (0..self.tracks.len()).collect();
             self.pos = current_track_idx;
@@ -174,6 +172,13 @@ pub fn ytdlp_args(id: &str, out: &Path, cookies: Option<&Path>) -> Vec<String> {
     args
 }
 
+async fn cleanup_temp(temp: &Path) {
+    let _ = tokio::fs::remove_file(temp).await;
+    let mut part = temp.as_os_str().to_os_string();
+    part.push(".part");
+    let _ = tokio::fs::remove_file(Path::new(&part)).await;
+}
+
 pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> {
     if !is_valid_id(id) {
         return Err(format!("Invalid YouTube track ID: {id}"));
@@ -184,8 +189,9 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     }
 
     let parent = final_path.parent().ok_or("Invalid cache path")?;
-    let temp_path = parent.join(format!("{id}.dl.m4a"));
-    let _ = tokio::fs::remove_file(&temp_path).await;
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!("{id}.{}-{n}.dl.m4a", std::process::id()));
+    cleanup_temp(&temp_path).await;
 
     let args = ytdlp_args(id, &temp_path, cookies);
     let output_res = tokio::process::Command::new("yt-dlp")
@@ -194,14 +200,23 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
         .await;
 
     if final_path.exists() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        cleanup_temp(&temp_path).await;
         return Ok(final_path);
     }
 
-    let output = output_res.map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+    let output = match output_res {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup_temp(&temp_path).await;
+            if final_path.exists() {
+                return Ok(final_path);
+            }
+            return Err(format!("Failed to run yt-dlp: {e}"));
+        }
+    };
 
     if !output.status.success() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        cleanup_temp(&temp_path).await;
         if final_path.exists() {
             return Ok(final_path);
         }
@@ -215,6 +230,7 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     }
 
     if !temp_path.exists() {
+        cleanup_temp(&temp_path).await;
         if final_path.exists() {
             return Ok(final_path);
         }
@@ -222,6 +238,7 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     }
 
     if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+        cleanup_temp(&temp_path).await;
         if final_path.exists() {
             return Ok(final_path);
         }
@@ -478,27 +495,64 @@ mod tests {
 
     #[test]
     fn test_queue_shuffle() {
-        let tracks = make_test_tracks(10);
-        let mut q = Queue::new(tracks, 3);
+        let tracks = make_test_tracks(20);
+        let mut q = Queue::new(tracks, 15);
         let current_id = q.current().unwrap().id.clone();
-        assert_eq!(current_id, "test_id_0003");
+        assert_eq!(current_id, "test_id_0015");
 
         // Enable shuffle
         q.set_shuffle(true);
-        // Current track stays current
+        // Current track is at pos 0 and order[0] == 15
+        assert_eq!(q.order[0], 15);
+        assert_eq!(q.pos, 0);
         assert_eq!(q.current().unwrap().id, current_id);
 
-        // Order is a valid permutation of 0..10
+        // Order is a valid permutation of 0..20
         let mut sorted_order = q.order.clone();
         sorted_order.sort();
-        assert_eq!(sorted_order, (0..10).collect::<Vec<usize>>());
+        assert_eq!(sorted_order, (0..20).collect::<Vec<usize>>());
 
-        // Toggle shuffle off
+        // Repeat Off yields exactly 19 more user-next tracks before None
+        assert_eq!(q.repeat, Repeat::Off);
+        for _ in 0..19 {
+            assert!(q.next(true).is_some());
+        }
+        assert!(q.next(true).is_none());
+
+        // Toggle shuffle off restores original order with pos = the current track's original index
+        let last_idx = q.order[q.pos];
         q.set_shuffle(false);
-        // Restores original order and current position
-        assert_eq!(q.order, (0..10).collect::<Vec<usize>>());
-        assert_eq!(q.pos, 3);
-        assert_eq!(q.current().unwrap().id, current_id);
+        assert_eq!(q.order, (0..20).collect::<Vec<usize>>());
+        assert_eq!(q.pos, last_idx);
+
+        // Immediate toggle off from initial shuffled state restores original index 15
+        let mut q2 = Queue::new(make_test_tracks(20), 15);
+        q2.set_shuffle(true);
+        assert_eq!(q2.order[0], 15);
+        assert_eq!(q2.pos, 0);
+        q2.set_shuffle(false);
+        assert_eq!(q2.order, (0..20).collect::<Vec<usize>>());
+        assert_eq!(q2.pos, 15);
+        assert_eq!(q2.current().unwrap().id, "test_id_0015");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_temp_removes_temp_and_part() {
+        let dir = std::env::temp_dir().join(format!("ytmfast_test_cleanup_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let temp_file = dir.join("test_track.dl.m4a");
+        let part_file = dir.join("test_track.dl.m4a.part");
+
+        tokio::fs::write(&temp_file, b"temp").await.unwrap();
+        tokio::fs::write(&part_file, b"part").await.unwrap();
+        assert!(temp_file.exists());
+        assert!(part_file.exists());
+
+        cleanup_temp(&temp_file).await;
+        assert!(!temp_file.exists());
+        assert!(!part_file.exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

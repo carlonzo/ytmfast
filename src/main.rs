@@ -141,7 +141,9 @@ impl eframe::App for App {
                     }
                 }
                 Event::Ready { id, path } => {
-                    if self.queue.current().map(|t| t.id.as_str()) == Some(&id) {
+                    if self.is_loading
+                        && self.queue.current().map(|t| t.id.as_str()) == Some(&id)
+                    {
                         self.is_loading = false;
                         if let Err(e) = self.player.play_file(&path) {
                             self.fetch_error = Some(e);
@@ -151,7 +153,9 @@ impl eframe::App for App {
                     }
                 }
                 Event::FetchError { id, msg } => {
-                    if self.queue.current().map(|t| t.id.as_str()) == Some(&id) {
+                    if self.is_loading
+                        && self.queue.current().map(|t| t.id.as_str()) == Some(&id)
+                    {
                         self.is_loading = false;
                         self.fetch_error = Some(msg);
                     }
@@ -173,8 +177,8 @@ impl eframe::App for App {
 
         let mut actions = Vec::new();
 
-        // Keyboard: Space toggles play/pause when the search box does not have focus
-        if !self.search_focused && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+        // Keyboard: Space toggles play/pause only when no widget has keyboard focus
+        if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             actions.push(Action::TogglePlayPause);
         }
 
