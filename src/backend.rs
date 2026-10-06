@@ -103,7 +103,7 @@ pub enum Cmd {
     Fetch(Track),
     SignIn(SignInSource),
     SignOut,
-    LoadLibrary,
+    LoadLibrary(u64),
 }
 
 pub enum Event {
@@ -118,8 +118,8 @@ pub enum Event {
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
     Auth { signed_in: bool, error: Option<String> },
-    Library(Library),
-    LibraryError(String),
+    Library { generation: u64, library: Library },
+    LibraryError { generation: u64, error: String },
 }
 
 pub fn select_thumbnail_min(covers: &[rustypipe::model::Thumbnail], min_width: u32) -> Option<String> {
@@ -417,6 +417,12 @@ impl Backend {
                     let _ = event_tx.send(Event::Auth { signed_in: true, error: None });
                 } else {
                     let _ = std::fs::remove_file(path);
+                    // File missing or rustypipe holds nothing useful: drop any
+                    // stale account cookie so authed page requests cannot
+                    // leak it. Runs on the backend thread before the loop.
+                    if let (Some(rt), Some(rp)) = (rt.as_ref(), rp.as_ref()) {
+                        let _ = rt.block_on(rp.user_auth_remove_cookie());
+                    }
                 }
             }
 
@@ -764,7 +770,10 @@ impl Backend {
                                     let cookie_file = cookie_file.as_ref().ok_or_else(|| {
                                         "No config dir: cannot store cookies".to_string()
                                     })?;
-                                    match source {
+                                    // Each arm returns the raw jar text; filtering,
+                                    // the cookie check, and the 0600 write below
+                                    // happen ONCE in shared code.
+                                    let (raw, import_stderr) = match source {
                                         SignInSource::Browser(browser) => {
                                             let args =
                                                 crate::auth::import_args(&browser, cookie_file)
@@ -772,7 +781,11 @@ impl Backend {
                                                         format!("Unsupported browser: {browser}")
                                                     })?;
                                             // 0600 placeholder BEFORE content lands.
-                                            crate::auth::write_cookie_file(cookie_file, "").await?;
+                                            crate::auth::write_cookie_file(
+                                                cookie_file,
+                                                crate::auth::COOKIE_FILE_HEADER,
+                                            )
+                                            .await?;
                                             let out = tokio::time::timeout(
                                                 Duration::from_secs(60),
                                                 tokio::process::Command::new("yt-dlp")
@@ -781,29 +794,25 @@ impl Backend {
                                                     .output(),
                                             )
                                             .await
-                                            .map_err(|_| "Browser import timed out".to_string())?
+                                            .map_err(|_| {
+                                                "Browser import timed out".to_string()
+                                            })?
                                             .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+                                            let stderr =
+                                                String::from_utf8_lossy(&out.stderr).into_owned();
                                             // yt-dlp exits 1 on the probe URL ("Unsupported
                                             // URL") but still saves the jar on close: do NOT
                                             // gate on exit status. Only the file counts.
-                                            let bytes = tokio::fs::read(cookie_file).await.map_err(
-                                                |_| {
-                                                    format!(
-                                                        "Browser import failed: {}",
-                                                        crate::auth::short_error(
-                                                            &String::from_utf8_lossy(&out.stderr)
+                                            let raw =
+                                                tokio::fs::read_to_string(cookie_file).await.map_err(
+                                                    |_| {
+                                                        format!(
+                                                            "Browser import failed: {}",
+                                                            crate::auth::short_error(&stderr)
                                                         )
-                                                    )
-                                                },
-                                            )?;
-                                            if bytes.is_empty() {
-                                                return Err(format!(
-                                                    "Browser import failed: {}",
-                                                    crate::auth::short_error(
-                                                        &String::from_utf8_lossy(&out.stderr)
-                                                    )
-                                                ));
-                                            }
+                                                    },
+                                                )?;
+                                            (raw, Some(stderr))
                                         }
                                         SignInSource::File(path) => {
                                             let src = tokio::task::spawn_blocking(move || {
@@ -815,24 +824,29 @@ impl Backend {
                                             .map_err(|e| {
                                                 format!("Cookie check task failed: {e}")
                                             })??;
-                                            let contents = tokio::fs::read_to_string(&src)
+                                            let raw = tokio::fs::read_to_string(&src)
                                                 .await
                                                 .map_err(|e| {
                                                     format!("Cannot read cookie file: {e}")
                                                 })?;
-                                            let filtered =
-                                                crate::auth::filter_cookies(&contents);
-                                            crate::auth::write_cookie_file(cookie_file, &filtered)
-                                                .await?;
+                                            (raw, None)
                                         }
-                                    }
-                                    let raw = tokio::fs::read_to_string(cookie_file)
-                                        .await
-                                        .map_err(|e| format!("Cannot read cookie file: {e}"))?;
+                                    };
                                     // Drop every non-youtube/google cookie, persist the
                                     // filtered jar 0600, and feed the FILTERED text.
                                     let filtered = crate::auth::filter_cookies(&raw);
                                     crate::auth::write_cookie_file(cookie_file, &filtered).await?;
+                                    if !crate::auth::has_cookies(&filtered) {
+                                        match import_stderr.as_deref() {
+                                            Some(stderr) => {
+                                                return Err(format!(
+                                                    "Browser import failed: {}",
+                                                    crate::auth::short_error(stderr)
+                                                ));
+                                            }
+                                            None => return Err("No cookies found".to_string()),
+                                        }
+                                    }
                                     rp_ref
                                         .user_auth_set_cookie_txt(&filtered)
                                         .await
@@ -891,7 +905,7 @@ impl Backend {
                                 });
                                 ctx.request_repaint();
                             }
-                            Cmd::LoadLibrary => {
+                            Cmd::LoadLibrary(generation) => {
                                 if let Some(rp) = rp {
                                     let q = rp.query();
                                     let (
@@ -958,9 +972,10 @@ impl Backend {
                                         }
                                     };
                                     if failures == 5 {
-                                        let _ = event_tx.send(Event::LibraryError(
-                                            "Failed to load library".to_string(),
-                                        ));
+                                        let _ = event_tx.send(Event::LibraryError {
+                                            generation,
+                                            error: "Failed to load library".to_string(),
+                                        });
                                     } else {
                                         let playlists = match liked_id {
                                             Some(id) => {
@@ -968,19 +983,25 @@ impl Backend {
                                             }
                                             None => playlists,
                                         };
-                                        let _ = event_tx.send(Event::Library(Library {
-                                            history,
-                                            playlists,
-                                            albums,
-                                            artists,
-                                            liked,
-                                        }));
+                                        let _ = event_tx.send(Event::Library {
+                                            generation,
+                                            library: Library {
+                                                history,
+                                                playlists,
+                                                albums,
+                                                artists,
+                                                liked,
+                                            },
+                                        });
                                     }
                                 } else {
                                     let err = rp_err.unwrap_or_else(|| {
                                         "RustyPipe init failed".to_string()
                                     });
-                                    let _ = event_tx.send(Event::LibraryError(err));
+                                    let _ = event_tx.send(Event::LibraryError {
+                                        generation,
+                                        error: err,
+                                    });
                                 }
                                 ctx.request_repaint();
                             }
@@ -1031,8 +1052,11 @@ impl Backend {
                                 error: None,
                             });
                         }
-                        Cmd::LoadLibrary => {
-                            let _ = event_tx.send(Event::LibraryError(err));
+                        Cmd::LoadLibrary(generation) => {
+                            let _ = event_tx.send(Event::LibraryError {
+                                generation,
+                                error: err,
+                            });
                         }
                     }
                     ctx.request_repaint();

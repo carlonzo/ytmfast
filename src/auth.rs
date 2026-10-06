@@ -9,6 +9,10 @@ pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome"
 
 /// Reject user-typed cookie files larger than this (checked via metadata first).
 pub const MAX_COOKIE_FILE_BYTES: u64 = 1024 * 1024;
+/// Placeholder written 0600 before a browser import lands: yt-dlp refuses
+/// a pre-existing EMPTY `--cookies` file ("does not look like a Netscape
+/// format cookies file") but accepts a header-only file.
+pub const COOKIE_FILE_HEADER: &str = "# Netscape HTTP Cookie File\n";
 
 /// Max history tracks kept on the Listen again shelf.
 pub const HISTORY_CAP: usize = 20;
@@ -87,6 +91,16 @@ pub fn filter_cookies(text: &str) -> String {
     }
     out
 }
+/// True iff the (already filtered) jar text holds at least one cookie
+/// line: a non-empty, non-comment line, or a `#HttpOnly_`-prefixed cookie
+/// line. Header-only text has no cookies.
+pub fn has_cookies(filtered: &str) -> bool {
+    filtered.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && (!line.starts_with('#') || line.starts_with("#HttpOnly_"))
+    })
+}
+
 
 /// Remove any existing file, then create with mode 0600 (`create_new`),
 /// write, and re-assert 0600. Never logs cookie contents.
@@ -345,6 +359,19 @@ mod tests {
         // Directory is not a regular file.
         let dir = std::env::temp_dir();
         assert!(resolve_user_cookie_file(dir.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_has_cookies() {
+        assert!(!has_cookies(""));
+        assert!(!has_cookies(COOKIE_FILE_HEADER));
+        assert!(!has_cookies("# Netscape HTTP Cookie File\n# some comment\n\n"));
+        assert!(has_cookies(
+            "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tval\n"
+        ));
+        assert!(has_cookies(
+            "# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tval\n"
+        ));
     }
 
     #[test]

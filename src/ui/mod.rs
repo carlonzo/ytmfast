@@ -306,7 +306,8 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                         )
                         .fill(COLOR_SURFACE)
                         .corner_radius(16);
-                        let avatar_clicked = ui.add(avatar).clicked();
+                        let avatar_resp = ui.add(avatar);
+                        let avatar_clicked = avatar_resp.clicked();
                         if avatar_clicked {
                             actions.push(Action::ToggleUserMenu);
                         }
@@ -324,10 +325,11 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                                             }
                                         });
                                 });
+                            let press_origin =
+                                ui.input(|i| i.pointer.press_origin().unwrap_or_default());
                             let clicked_outside = ui.input(|i| i.pointer.any_pressed())
-                                && !menu_resp.response.rect.contains(
-                                    ui.input(|i| i.pointer.press_origin().unwrap_or_default()),
-                                );
+                                && !menu_resp.response.rect.contains(press_origin)
+                                && !avatar_resp.rect.contains(press_origin);
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) || clicked_outside
                             {
                                 actions.push(Action::ToggleUserMenu);

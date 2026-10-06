@@ -47,6 +47,7 @@ pub struct App {
     pub sign_in_browser: String,
     pub sign_in_file: String,
     pub show_user_menu: bool,
+    pub auth_generation: u64,
     pub library: Option<Library>,
     pub library_loading: bool,
     pub library_error: Option<String>,
@@ -97,6 +98,7 @@ impl App {
             sign_in_browser: "firefox".to_string(),
             sign_in_file: String::new(),
             show_user_menu: false,
+            auth_generation: 0,
             library: None,
             library_loading: false,
             library_error: None,
@@ -140,7 +142,7 @@ impl App {
                 if self.signed_in && self.library.is_none() && !self.library_loading {
                     self.library_loading = true;
                     self.library_error = None;
-                    self.backend.send(Cmd::LoadLibrary);
+                    self.backend.send(Cmd::LoadLibrary(self.auth_generation));
                 }
             }
             View::Search(q) => {
@@ -245,7 +247,6 @@ impl App {
             }
             Action::ShowSignIn => {
                 self.show_sign_in = true;
-                self.auth_error = None;
                 self.show_user_menu = false;
             }
             Action::HideSignIn => {
@@ -266,6 +267,7 @@ impl App {
             }
             Action::SignOut => {
                 self.show_user_menu = false;
+                self.auth_generation = self.auth_generation.wrapping_add(1);
                 // Leave private pages so the view is not blank after sign-out.
                 match &self.nav.current {
                     View::Playlist(_) | View::Album(_) | View::Artist(_) | View::Library => {
@@ -314,7 +316,7 @@ impl App {
                 View::Library => {
                     self.library_error = None;
                     self.library_loading = true;
-                    self.backend.send(Cmd::LoadLibrary);
+                    self.backend.send(Cmd::LoadLibrary(self.auth_generation));
                 }
             },
         }
@@ -396,11 +398,12 @@ impl eframe::App for App {
                     self.signed_in = signed_in;
                     self.sign_in_busy = false;
                     if signed_in {
+                        self.auth_generation = self.auth_generation.wrapping_add(1);
                         self.auth_error = None;
                         self.show_sign_in = false;
                         self.library_loading = true;
                         self.library_error = None;
-                        self.backend.send(Cmd::LoadLibrary);
+                        self.backend.send(Cmd::LoadLibrary(self.auth_generation));
                     } else if error.is_none() {
                         // Clean sign-out (not a failed sign-in): drop library
                         // and any cached private pages.
@@ -414,20 +417,20 @@ impl eframe::App for App {
                         self.auth_error = error;
                     }
                 }
-                Event::Library(lib) => {
-                    if !self.signed_in {
+                Event::Library { generation, library } => {
+                    if !self.signed_in || generation != self.auth_generation {
                         continue;
                     }
                     self.library_loading = false;
                     self.library_error = None;
-                    self.library = Some(lib);
+                    self.library = Some(library);
                 }
-                Event::LibraryError(err) => {
-                    if !self.signed_in {
+                Event::LibraryError { generation, error } => {
+                    if !self.signed_in || generation != self.auth_generation {
                         continue;
                     }
                     self.library_loading = false;
-                    self.library_error = Some(err);
+                    self.library_error = Some(error);
                 }
             }
         }
