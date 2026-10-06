@@ -1,9 +1,12 @@
 mod audio;
+mod auth;
 mod backend;
 mod ui;
 
 use audio::{Player, Queue};
-use backend::{ArtistPage, Backend, Cmd, Collection, Event, Home, SearchAll, Track};
+use backend::{
+    ArtistPage, Backend, Cmd, Collection, Event, Home, Library, SearchAll, SignInSource, Track,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use ui::{Action, Nav, View};
@@ -35,6 +38,27 @@ pub struct App {
     pub artists: HashMap<String, ArtistPage>,
     pub artists_loading: HashSet<String>,
     pub artist_errors: HashMap<String, String>,
+
+    // Auth + library (M3). Signed-in state comes from the cookie file on disk.
+    pub signed_in: bool,
+    pub auth_error: Option<String>,
+    pub show_sign_in: bool,
+    pub sign_in_busy: bool,
+    pub sign_in_browser: String,
+    pub sign_in_file: String,
+    pub show_user_menu: bool,
+    pub library: Option<Library>,
+    pub library_loading: bool,
+    pub library_error: Option<String>,
+    pub library_chip: LibraryChip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryChip {
+    Playlists,
+    Songs,
+    Albums,
+    Artists,
 }
 
 impl App {
@@ -66,6 +90,17 @@ impl App {
             artists: HashMap::new(),
             artists_loading: HashSet::new(),
             artist_errors: HashMap::new(),
+            signed_in: false,
+            auth_error: None,
+            show_sign_in: false,
+            sign_in_busy: false,
+            sign_in_browser: "firefox".to_string(),
+            sign_in_file: String::new(),
+            show_user_menu: false,
+            library: None,
+            library_loading: false,
+            library_error: None,
+            library_chip: LibraryChip::Playlists,
         }
     }
 
@@ -101,7 +136,13 @@ impl App {
                     self.backend.send(Cmd::LoadHome);
                 }
             }
-            View::Library => {}
+            View::Library => {
+                if self.signed_in && self.library.is_none() && !self.library_loading {
+                    self.library_loading = true;
+                    self.library_error = None;
+                    self.backend.send(Cmd::LoadLibrary);
+                }
+            }
             View::Search(q) => {
                 if !self.search_results.contains_key(q) && !self.search_loading.contains(q) {
                     self.search_loading.insert(q.clone());
@@ -202,6 +243,35 @@ impl App {
             Action::ToggleSidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
             }
+            Action::ShowSignIn => {
+                self.show_sign_in = true;
+                self.auth_error = None;
+                self.show_user_menu = false;
+            }
+            Action::HideSignIn => {
+                self.show_sign_in = false;
+                self.sign_in_busy = false;
+            }
+            Action::SignInBrowser(browser) => {
+                self.sign_in_busy = true;
+                self.auth_error = None;
+                self.backend.send(Cmd::SignIn(SignInSource::Browser(browser)));
+            }
+            Action::SignInFile(path) => {
+                self.sign_in_busy = true;
+                self.auth_error = None;
+                self.backend.send(Cmd::SignIn(SignInSource::File(path.into())));
+            }
+            Action::SignOut => {
+                self.show_user_menu = false;
+                self.backend.send(Cmd::SignOut);
+            }
+            Action::ToggleUserMenu => {
+                self.show_user_menu = !self.show_user_menu;
+            }
+            Action::SetLibraryChip(chip) => {
+                self.library_chip = chip;
+            }
             Action::Radio(video_id) => {
                 self.backend.send(Cmd::Radio(video_id));
             }
@@ -231,7 +301,11 @@ impl App {
                     self.artists_loading.insert(id.clone());
                     self.backend.send(Cmd::OpenArtist(id));
                 }
-                View::Library => {}
+                View::Library => {
+                    self.library_error = None;
+                    self.library_loading = true;
+                    self.backend.send(Cmd::LoadLibrary);
+                }
             },
         }
     }
@@ -308,6 +382,39 @@ impl eframe::App for App {
                         self.fetch_error = Some(msg);
                     }
                 }
+                Event::Auth { signed_in, error } => {
+                    self.signed_in = signed_in;
+                    self.sign_in_busy = false;
+                    if signed_in {
+                        self.auth_error = None;
+                        self.show_sign_in = false;
+                        self.library_loading = true;
+                        self.library_error = None;
+                        self.backend.send(Cmd::LoadLibrary);
+                        self.home_loading = true;
+                        self.home_error = None;
+                        self.backend.send(Cmd::LoadHome);
+                    } else if error.is_none() {
+                        // Clean sign-out (not a failed sign-in): drop library
+                        // and any cached private pages.
+                        self.auth_error = None;
+                        self.library = None;
+                        self.library_error = None;
+                        self.collections.clear();
+                        self.collection_errors.clear();
+                    } else {
+                        self.auth_error = error;
+                    }
+                }
+                Event::Library(lib) => {
+                    self.library_loading = false;
+                    self.library_error = None;
+                    self.library = Some(lib);
+                }
+                Event::LibraryError(err) => {
+                    self.library_loading = false;
+                    self.library_error = Some(err);
+                }
             }
         }
 
@@ -343,6 +450,7 @@ impl eframe::App for App {
         ui::draw_left_sidebar(ui, self, &mut actions);
         ui::draw_player_bar(ui, self, &mut actions);
         ui::draw_central_panel(ui, self, &mut actions);
+        ui::draw_sign_in_dialog(ui, self, &mut actions);
 
         // Apply actions
         for action in actions {

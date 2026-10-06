@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
@@ -76,6 +78,20 @@ pub struct SearchAll {
     pub artists: Vec<Card>,
     pub playlists: Vec<Card>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    pub history: Vec<Track>,
+    pub playlists: Vec<Card>,
+    pub albums: Vec<Card>,
+    pub artists: Vec<Card>,
+    pub liked: Vec<Track>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SignInSource {
+    Browser(String),
+    File(PathBuf),
+}
 
 pub enum Cmd {
     LoadHome,
@@ -85,6 +101,9 @@ pub enum Cmd {
     OpenArtist(String),
     Radio(String),
     Fetch(Track),
+    SignIn(SignInSource),
+    SignOut,
+    LoadLibrary,
 }
 
 pub enum Event {
@@ -98,6 +117,9 @@ pub enum Event {
     PageError { id: String, error: String },
     Ready { id: String, path: PathBuf },
     FetchError { id: String, msg: String },
+    Auth { signed_in: bool, error: Option<String> },
+    Library(Library),
+    LibraryError(String),
 }
 
 pub fn select_thumbnail_min(covers: &[rustypipe::model::Thumbnail], min_width: u32) -> Option<String> {
@@ -319,6 +341,53 @@ pub struct Backend {
     rx: mpsc::Receiver<Event>,
 }
 
+fn cookie_path_now(cookies: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathBuf> {
+    cookies.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Create parent dir + empty 0600 file BEFORE content lands, then re-assert
+/// 0600 after writing. Never logs cookie contents.
+async fn write_cookie_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Cannot create config dir: {e}"))?;
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await
+        .map_err(|e| format!("Cannot create cookie file: {e}"))?;
+    drop(file);
+    tokio::fs::write(path, contents)
+        .await
+        .map_err(|e| format!("Cannot write cookie file: {e}"))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| format!("Cannot secure cookie file: {e}"))?;
+    Ok(())
+}
+
+async fn fail_auth(
+    event_tx: &mpsc::Sender<Event>,
+    ctx: &egui::Context,
+    rp: Option<&Arc<rustypipe::client::RustyPipe>>,
+    cookies: &std::sync::RwLock<Option<PathBuf>>,
+    cookie_file: &Path,
+    error: String,
+) {
+    let _ = tokio::fs::remove_file(cookie_file).await;
+    if let Some(rp) = rp {
+        let _ = rp.user_auth_remove_cookie().await;
+    }
+    *cookies.write().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = event_tx.send(Event::Auth { signed_in: false, error: Some(error) });
+    ctx.request_repaint();
+}
+
 impl Backend {
     pub fn new(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -345,6 +414,17 @@ impl Backend {
                 Ok(rp) => (Some(Arc::new(rp)), None),
                 Err(e) => (None, Some(format!("RustyPipe init error: {e}"))),
             };
+            let cookies: std::sync::Arc<std::sync::RwLock<Option<PathBuf>>> =
+                std::sync::Arc::new(std::sync::RwLock::new(None));
+            let cookie_file = crate::auth::cookie_path();
+            // Signed-in state is derived from the cookie file on disk:
+            // rustypipe persisted its cookie in storage_dir, so if our file
+            // survived, the session is still usable.
+            if cookie_file.is_file() {
+                *cookies.write().unwrap_or_else(|e| e.into_inner()) =
+                    Some(cookie_file.clone());
+                let _ = event_tx.send(Event::Auth { signed_in: true, error: None });
+            }
 
             let _guard = rt.as_ref().map(|r| r.enter());
             while let Ok(cmd) = cmd_rx.recv() {
@@ -353,7 +433,8 @@ impl Backend {
                 let rp = rp.clone();
                 let rp_err = rp_err.clone();
                 let rt_err = rt_err.clone();
-
+                let cookies = cookies.clone();
+                let cookie_file = cookie_file.clone();
                 if let Some(rt_ref) = &rt {
                     rt_ref.spawn(async move {
                         match cmd {
@@ -497,7 +578,11 @@ impl Backend {
                             }
                             Cmd::OpenAlbum(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_album(&id).await {
+                                    let mut q = rp.query();
+                                    if cookie_path_now(&cookies).is_some() {
+                                        q = q.authenticated();
+                                    }
+                                    match q.music_album(&id).await {
                                         Ok(album) => {
                                             let total_secs: u32 = album
                                                 .tracks
@@ -552,7 +637,11 @@ impl Backend {
                             }
                             Cmd::OpenPlaylist(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_playlist(&id).await {
+                                    let mut q = rp.query();
+                                    if cookie_path_now(&cookies).is_some() {
+                                        q = q.authenticated();
+                                    }
+                                    match q.music_playlist(&id).await {
                                         Ok(playlist) => {
                                             let total_secs: u32 = playlist
                                                 .tracks
@@ -609,7 +698,11 @@ impl Backend {
                             }
                             Cmd::OpenArtist(id) => {
                                 if let Some(rp) = rp {
-                                    match rp.query().music_artist(&id, false).await {
+                                    let mut q = rp.query();
+                                    if cookie_path_now(&cookies).is_some() {
+                                        q = q.authenticated();
+                                    }
+                                    match q.music_artist(&id, false).await {
                                         Ok(artist) => {
                                             let thumb_url =
                                                 select_thumbnail_largest(&artist.header_image);
@@ -675,8 +768,202 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
+                            Cmd::SignIn(source) => {
+                                let result: Result<(), String> = async {
+                                    let rp_ref = rp.as_ref().ok_or_else(|| {
+                                        rp_err
+                                            .clone()
+                                            .unwrap_or_else(|| "RustyPipe init failed".to_string())
+                                    })?;
+                                    match source {
+                                        SignInSource::Browser(browser) => {
+                                            let args =
+                                                crate::auth::import_args(&browser, &cookie_file)
+                                                    .ok_or_else(|| {
+                                                        format!("Unsupported browser: {browser}")
+                                                    })?;
+                                            // 0600 placeholder BEFORE content lands.
+                                            write_cookie_file(&cookie_file, "").await?;
+                                            let out = tokio::time::timeout(
+                                                Duration::from_secs(60),
+                                                tokio::process::Command::new("yt-dlp")
+                                                    .args(&args)
+                                                    .output(),
+                                            )
+                                            .await
+                                            .map_err(|_| "Browser import timed out".to_string())?
+                                            .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+                                            if !out.status.success() {
+                                                let stderr =
+                                                    String::from_utf8_lossy(&out.stderr);
+                                                return Err(format!(
+                                                    "Browser import failed: {}",
+                                                    crate::auth::short_error(&stderr)
+                                                ));
+                                            }
+                                            tokio::fs::set_permissions(
+                                                &cookie_file,
+                                                std::fs::Permissions::from_mode(0o600),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                format!("Cannot secure cookie file: {e}")
+                                            })?;
+                                        }
+                                        SignInSource::File(path) => {
+                                            let contents = tokio::fs::read_to_string(&path)
+                                                .await
+                                                .map_err(|e| {
+                                                    format!("Cannot read cookie file: {e}")
+                                                })?;
+                                            write_cookie_file(&cookie_file, &contents).await?;
+                                        }
+                                    }
+                                    let txt = tokio::fs::read_to_string(&cookie_file)
+                                        .await
+                                        .map_err(|e| format!("Cannot read cookie file: {e}"))?;
+                                    rp_ref
+                                        .user_auth_set_cookie_txt(&txt)
+                                        .await
+                                        .map_err(|e| format!("Invalid cookies: {e}"))?;
+                                    rp_ref
+                                        .user_auth_check_cookie()
+                                        .await
+                                        .map_err(|e| format!("Cookie check failed: {e}"))?;
+                                    Ok(())
+                                }
+                                .await;
+                                match result {
+                                    Ok(()) => {
+                                        *cookies.write().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(cookie_file.clone());
+                                        let _ = event_tx.send(Event::Auth {
+                                            signed_in: true,
+                                            error: None,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        fail_auth(
+                                            &event_tx,
+                                            &ctx,
+                                            rp.as_ref(),
+                                            &cookies,
+                                            &cookie_file,
+                                            error,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::SignOut => {
+                                let _ = tokio::fs::remove_file(&cookie_file).await;
+                                if let Some(rp) = &rp {
+                                    let _ = rp.user_auth_remove_cookie().await;
+                                }
+                                *cookies.write().unwrap_or_else(|e| e.into_inner()) = None;
+                                let _ = event_tx.send(Event::Auth {
+                                    signed_in: false,
+                                    error: None,
+                                });
+                                ctx.request_repaint();
+                            }
+                            Cmd::LoadLibrary => {
+                                if let Some(rp) = rp {
+                                    let q = rp.query();
+                                    let (
+                                        history_res,
+                                        playlists_res,
+                                        albums_res,
+                                        artists_res,
+                                        liked_res,
+                                    ) = tokio::join!(
+                                        q.music_history(),
+                                        q.music_saved_playlists(),
+                                        q.music_saved_albums(),
+                                        q.music_saved_artists(),
+                                        q.music_liked_tracks(),
+                                    );
+                                    let mut failures = 0;
+                                    let history = match history_res {
+                                        Ok(p) => crate::auth::dedupe_history(
+                                            p.items
+                                                .into_iter()
+                                                .map(|h| track_from(h.item))
+                                                .collect(),
+                                        ),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let playlists = match playlists_res {
+                                        Ok(p) => {
+                                            p.items.into_iter().map(playlist_card).collect()
+                                        }
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let albums = match albums_res {
+                                        Ok(p) => p.items.into_iter().map(album_card).collect(),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let artists = match artists_res {
+                                        Ok(p) => p.items.into_iter().map(artist_card).collect(),
+                                        Err(_) => {
+                                            failures += 1;
+                                            Vec::new()
+                                        }
+                                    };
+                                    let (liked_id, liked) = match liked_res {
+                                        Ok(pl) => (
+                                            Some(pl.id),
+                                            pl.tracks
+                                                .items
+                                                .into_iter()
+                                                .map(track_from)
+                                                .collect(),
+                                        ),
+                                        Err(_) => {
+                                            failures += 1;
+                                            (None, Vec::new())
+                                        }
+                                    };
+                                    if failures == 5 {
+                                        let _ = event_tx.send(Event::LibraryError(
+                                            "Failed to load library".to_string(),
+                                        ));
+                                    } else {
+                                        let playlists = match liked_id {
+                                            Some(id) => {
+                                                crate::auth::with_liked_first(playlists, &id)
+                                            }
+                                            None => playlists,
+                                        };
+                                        let _ = event_tx.send(Event::Library(Library {
+                                            history,
+                                            playlists,
+                                            albums,
+                                            artists,
+                                            liked,
+                                        }));
+                                    }
+                                } else {
+                                    let err = rp_err.unwrap_or_else(|| {
+                                        "RustyPipe init failed".to_string()
+                                    });
+                                    let _ = event_tx.send(Event::LibraryError(err));
+                                }
+                                ctx.request_repaint();
+                            }
                             Cmd::Fetch(track) => {
-                                match crate::audio::fetch(&track.id, None).await {
+                                let cookies_now = cookie_path_now(&cookies);
+                                match crate::audio::fetch(&track.id, cookies_now.as_deref()).await {
                                     Ok(path) => {
                                         let _ = event_tx.send(Event::Ready {
                                             id: track.id,
@@ -708,6 +995,21 @@ impl Backend {
                         }
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
+                        }
+                        Cmd::SignIn(_) => {
+                            let _ = event_tx.send(Event::Auth {
+                                signed_in: false,
+                                error: Some(err),
+                            });
+                        }
+                        Cmd::SignOut => {
+                            let _ = event_tx.send(Event::Auth {
+                                signed_in: false,
+                                error: None,
+                            });
+                        }
+                        Cmd::LoadLibrary => {
+                            let _ = event_tx.send(Event::LibraryError(err));
                         }
                     }
                     ctx.request_repaint();

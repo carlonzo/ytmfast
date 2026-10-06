@@ -31,7 +31,11 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
         return;
     };
 
-    // 1. Top songs: 4-row grid of compact song rows
+    // 0. Signed-in shelves first: Listen again + Your playlists.
+    if app.signed_in {
+        draw_home_library_shelves(ui, app, actions);
+    }
+
     if !home.top_songs.is_empty() {
         ui.label(
             egui::RichText::new("Top songs")
@@ -770,18 +774,6 @@ pub fn draw_artist(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec<Act
     ui.add_space(40.0);
 }
 
-pub fn draw_library(ui: &mut egui::Ui, _app: &App, _actions: &mut Vec<Action>) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(140.0);
-        ui.label(
-            egui::RichText::new("📚")
-                .size(48.0),
-        );
-        ui.add_space(16.0);
-        ui.label(
-            egui::RichText::new("Sign in to see your library")
-                .color(COLOR_TEXT_SECONDARY)
-                .size(18.0),
-        );
-    });
+pub fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
+    draw_library_page(ui, app, actions);
 }

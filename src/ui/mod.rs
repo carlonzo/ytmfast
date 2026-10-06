@@ -1,10 +1,11 @@
+pub mod library;
 pub mod pages;
 
 use std::time::Duration;
 use crate::audio::Repeat;
 use crate::backend::{Card, CardKind, Track};
 use crate::App;
-
+pub use library::*;
 pub use pages::*;
 
 pub const COLOR_BG: egui::Color32 = egui::Color32::from_rgb(0x03, 0x03, 0x03);
@@ -150,6 +151,13 @@ pub enum Action {
     ToggleSidebar,
     Radio(String),
     Retry(View),
+    ShowSignIn,
+    HideSignIn,
+    SignInBrowser(String),
+    SignInFile(String),
+    SignOut,
+    ToggleUserMenu,
+    SetLibraryChip(crate::LibraryChip),
 }
 
 pub fn format_duration(d: Duration) -> String {
@@ -288,18 +296,46 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                     }
                 }
 
-                // Right aligned Sign in button placeholder
+                // Right aligned Sign in / avatar button
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
-                    let sign_in_btn = egui::Button::image_and_text(
-                        Icon::User.image(COLOR_TEXT_SECONDARY, 16.0),
-                        egui::RichText::new("Sign in")
-                            .color(COLOR_TEXT_SECONDARY)
-                            .size(13.0),
-                    )
-                    .fill(COLOR_SURFACE)
-                    .corner_radius(16);
-                    let _ = ui.add_enabled(false, sign_in_btn);
+                    if app.signed_in {
+                        let avatar = egui::Button::image(
+                            Icon::User.image(COLOR_TEXT_PRIMARY, 16.0),
+                        )
+                        .fill(COLOR_SURFACE)
+                        .corner_radius(16);
+                        if ui.add(avatar).clicked() {
+                            actions.push(Action::ToggleUserMenu);
+                        }
+                        if app.show_user_menu {
+                            egui::Area::new(egui::Id::new("user_menu"))
+                                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 56.0))
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::new()
+                                        .fill(COLOR_SURFACE)
+                                        .corner_radius(8)
+                                        .inner_margin(egui::Margin::same(8))
+                                        .show(ui, |ui| {
+                                            if ui.button("Sign out").clicked() {
+                                                actions.push(Action::SignOut);
+                                            }
+                                        });
+                                });
+                        }
+                    } else {
+                        let sign_in_btn = egui::Button::image_and_text(
+                            Icon::User.image(COLOR_TEXT_SECONDARY, 16.0),
+                            egui::RichText::new("Sign in")
+                                .color(COLOR_TEXT_SECONDARY)
+                                .size(13.0),
+                        )
+                        .fill(COLOR_SURFACE)
+                        .corner_radius(16);
+                        if ui.add(sign_in_btn).clicked() {
+                            actions.push(Action::ShowSignIn);
+                        }
+                    }
                 });
             });
         });
@@ -421,12 +457,62 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                 .corner_radius(16);
                 let _ = ui.add_enabled(false, new_playlist_btn);
 
-                ui.add_space(20.0);
-                ui.label(
-                    egui::RichText::new("Sign in to see your playlists")
-                        .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
-                        .size(12.0),
-                );
+                ui.add_space(12.0);
+                if app.signed_in {
+                    if let Some(lib) = &app.library {
+                        egui::ScrollArea::vertical()
+                            .id_salt("sidebar_playlists")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for pl in &lib.playlists {
+                                    let is_active =
+                                        app.nav.current == View::Playlist(pl.id.clone());
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(width - 20.0, 32.0),
+                                        egui::Sense::click(),
+                                    );
+                                    if resp.hovered() || is_active {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            egui::CornerRadius::same(6),
+                                            COLOR_SURFACE,
+                                        );
+                                    }
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(rect),
+                                        |ui| {
+                                            ui.horizontal_centered(|ui| {
+                                                ui.add_space(12.0);
+                                                ui.label(
+                                                    egui::RichText::new(&pl.title)
+                                                        .color(if is_active {
+                                                            COLOR_TEXT_PRIMARY
+                                                        } else {
+                                                            COLOR_TEXT_SECONDARY
+                                                        })
+                                                        .size(13.0),
+                                                );
+                                            });
+                                        },
+                                    );
+                                    if resp.clicked() {
+                                        actions.push(Action::Navigate(View::Playlist(
+                                            pl.id.clone(),
+                                        )));
+                                    }
+                                }
+                            });
+                    } else if app.library_loading {
+                        ui.spinner();
+                    }
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Sign in to see your playlists")
+                            .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
+                            .size(12.0),
+                    );
+                }
             } else {
                 let plus_btn = egui::Button::image(
                     Icon::Plus.image(egui::Color32::from_rgb(0x77, 0x77, 0x77), 16.0),
