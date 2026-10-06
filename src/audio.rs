@@ -5,7 +5,7 @@ use crate::backend::Track;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Repeat {
     Off,
     All,
@@ -77,6 +77,27 @@ impl Queue {
         }
     }
 
+    /// Track auto-advance would play next, without mutating. Repeat One =>
+    /// current (nothing new to fetch); last with Off => None; last with All
+    /// wraps to order[0]. Mirrors `next(false)`.
+    pub fn peek_next(&self) -> Option<&Track> {
+        if self.order.is_empty() {
+            return None;
+        }
+        if self.repeat == Repeat::One {
+            return self.current();
+        }
+        if self.pos + 1 < self.order.len() {
+            let idx = self.order[self.pos + 1];
+            self.tracks.get(idx)
+        } else {
+            match self.repeat {
+                Repeat::All => self.order.first().and_then(|&idx| self.tracks.get(idx)),
+                Repeat::Off | Repeat::One => None,
+            }
+        }
+    }
+
     pub fn prev(&mut self) -> Option<&Track> {
         if self.order.is_empty() {
             return None;
@@ -141,6 +162,20 @@ impl Queue {
     }
 }
 
+/// Track worth prefetching now: `peek_next` unless it is the current track
+/// (repeat One / single-track loop => nothing new) or was already requested.
+pub fn prefetch_target(queue: &Queue, already: Option<&str>) -> Option<Track> {
+    let next = queue.peek_next()?;
+    let current_id = queue.current().map(|t| t.id.as_str());
+    if Some(next.id.as_str()) == current_id {
+        return None;
+    }
+    if already == Some(next.id.as_str()) {
+        return None;
+    }
+    Some(next.clone())
+}
+
 pub fn is_valid_id(id: &str) -> bool {
     id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
@@ -179,15 +214,33 @@ async fn cleanup_temp(temp: &Path) {
     let _ = tokio::fs::remove_file(Path::new(&part)).await;
 }
 
+/// One async lock per track id, so a Fetch racing a still-running Prefetch
+/// of the same id waits instead of spawning a second yt-dlp. The second
+/// caller then hits the cache-exists check above and still gets its Ready.
+/// Entries are left in the map (ponytail: 11-char keys, bounded by library
+/// size).
+static FETCH_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn fetch_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut locks = FETCH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> {
     if !is_valid_id(id) {
         return Err(format!("Invalid YouTube track ID: {id}"));
     }
+    let lock = fetch_lock(id);
+    let _guard = lock.lock().await;
     let final_path = cache_path(id);
     if final_path.exists() {
         return Ok(final_path);
     }
-
     let parent = final_path.parent().ok_or("Invalid cache path")?;
 
     for attempt in 0..2 {
@@ -604,5 +657,84 @@ mod tests {
             "expected duration > 60 s, got {:?}",
             duration
         );
+    }
+
+    #[test]
+    fn test_peek_next() {
+        // Middle of list
+        let q = Queue::new(make_test_tracks(3), 0);
+        assert_eq!(q.peek_next().unwrap().id, "test_id_0001");
+
+        // Last item, repeat Off => None
+        let mut q = Queue::new(make_test_tracks(3), 2);
+        assert!(q.peek_next().is_none());
+
+        // Last item, repeat All => first in order
+        q.repeat = Repeat::All;
+        assert_eq!(q.peek_next().unwrap().id, "test_id_0000");
+
+        // Repeat One => current
+        q.repeat = Repeat::One;
+        assert_eq!(q.peek_next().unwrap().id, "test_id_0002");
+
+        // Shuffle on => order[pos+1]
+        let mut q = Queue::new(make_test_tracks(20), 0);
+        q.repeat = Repeat::Off;
+        q.set_shuffle(true);
+        let expected = q.tracks[q.order[1]].id.clone();
+        assert_eq!(q.peek_next().unwrap().id, expected);
+
+        // Empty queue => None
+        let q = Queue::new(Vec::new(), 0);
+        assert!(q.peek_next().is_none());
+
+        // Does not mutate: call twice, current unchanged
+        let q = Queue::new(make_test_tracks(3), 1);
+        let first = q.peek_next().unwrap().id.clone();
+        let second = q.peek_next().unwrap().id.clone();
+        assert_eq!(first, second);
+        assert_eq!(q.current().unwrap().id, "test_id_0001");
+        assert_eq!(q.pos, 1);
+    }
+
+    #[test]
+    fn test_prefetch_target() {
+        // Middle => Some(next)
+        let q = Queue::new(make_test_tracks(3), 0);
+        let t = prefetch_target(&q, None).unwrap();
+        assert_eq!(t.id, "test_id_0001");
+
+        // Already requested => None
+        let q = Queue::new(make_test_tracks(3), 0);
+        assert!(prefetch_target(&q, Some("test_id_0001")).is_none());
+
+        // Repeat One => next == current => None
+        let mut q = Queue::new(make_test_tracks(3), 1);
+        q.repeat = Repeat::One;
+        assert!(prefetch_target(&q, None).is_none());
+
+        // Single-track repeat All => wraps to itself => None
+        let mut q = Queue::new(make_test_tracks(1), 0);
+        q.repeat = Repeat::All;
+        assert!(prefetch_target(&q, None).is_none());
+
+        // Last with repeat Off => None
+        let q = Queue::new(make_test_tracks(3), 2);
+        assert!(prefetch_target(&q, None).is_none());
+
+        // Last with repeat All => wraps to first => Some
+        let mut q = Queue::new(make_test_tracks(3), 2);
+        q.repeat = Repeat::All;
+        let t = prefetch_target(&q, None).unwrap();
+        assert_eq!(t.id, "test_id_0000");
+    }
+
+    #[test]
+    fn test_fetch_lock_same_arc_per_id() {
+        let a1 = fetch_lock("dQw4w9WgXcQ");
+        let a2 = fetch_lock("dQw4w9WgXcQ");
+        assert!(std::sync::Arc::ptr_eq(&a1, &a2));
+        let b = fetch_lock("e9Qw4w9WgXcQ");
+        assert!(!std::sync::Arc::ptr_eq(&a1, &b));
     }
 }

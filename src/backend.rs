@@ -85,6 +85,7 @@ pub enum Cmd {
     OpenArtist(String),
     Radio(String),
     Fetch(Track),
+    Prefetch(Track),
 }
 
 pub enum Event {
@@ -692,6 +693,14 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
+                            Cmd::Prefetch(track) => {
+                                // Warm the cache for the likely-next track. No
+                                // event on success; failures stay silent.
+                                if crate::audio::fetch(&track.id, None).await.is_err() {
+                                    eprintln!("prefetch failed: {}", track.id);
+                                }
+                                ctx.request_repaint();
+                            }
                         }
                     });
                 } else {
@@ -709,6 +718,7 @@ impl Backend {
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
                         }
+                        Cmd::Prefetch(_) => {}
                     }
                     ctx.request_repaint();
                 }

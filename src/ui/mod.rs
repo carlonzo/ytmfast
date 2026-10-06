@@ -18,12 +18,18 @@ pub const COLOR_ACCENT_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x00, 
 fastframe_icons::icons! {
     pub enum Icon {
         prefix: "ytm-icon-",
-        directory: "../assets/icons/",
+        directory: "../../assets/icons/",
         Menu => lucide "panel-left",
         Search => lucide "search",
         Back => lucide "arrow-left",
         Play => lucide "play",
         Pause => lucide "pause",
+        Prev => "skip-back",
+        Next => "skip-forward",
+        Shuffle => "shuffle",
+        Repeat => "repeat",
+        RepeatOne => "repeat-1",
+        Queue => "list-music",
         Volume => lucide "volume-2",
         VolumeMute => lucide "volume-x",
         Plus => lucide "plus",
@@ -34,7 +40,7 @@ fastframe_icons::icons! {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum View {
     Home,
     Explore,
@@ -145,6 +151,15 @@ pub enum Action {
     SetVolume(f32),
     ToggleShuffle,
     CycleRepeat,
+    SetShuffle(bool),
+    SetRepeat(fastframe_now_playing::Repeat),
+    Jump(usize),
+    ToggleQueue,
+    Resume,
+    Pause,
+    SeekRelative(i64),
+    Raise,
+    Quit,
     Navigate(View),
     Back,
     ToggleSidebar,
@@ -523,7 +538,10 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
             ui.horizontal_centered(|ui| {
                 ui.add_space(16.0);
 
-                if ui.button(egui::RichText::new("⏮").size(16.0)).clicked() {
+                if ui
+                    .add(egui::Button::image(Icon::Prev.image(COLOR_TEXT_PRIMARY, 20.0)).frame(false))
+                    .clicked()
+                {
                     actions.push(Action::PrevTrack);
                 }
 
@@ -540,7 +558,10 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                     actions.push(Action::TogglePlayPause);
                 }
 
-                if ui.button(egui::RichText::new("⏭").size(16.0)).clicked() {
+                if ui
+                    .add(egui::Button::image(Icon::Next.image(COLOR_TEXT_PRIMARY, 20.0)).frame(false))
+                    .clicked()
+                {
                     actions.push(Action::NextTrack(true));
                 }
 
@@ -558,6 +579,24 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
+
+                    let queue_color = if app.queue_open {
+                        COLOR_ACCENT_RED
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    };
+                    if ui
+                        .add(egui::Button::image(Icon::Queue.image(queue_color, 18.0)).frame(false))
+                        .on_hover_text(if app.queue_open {
+                            "Close queue"
+                        } else {
+                            "Open queue"
+                        })
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleQueue);
+                    }
+                    ui.add_space(8.0);
 
                     let mut vol = app.player.volume();
                     if ui
@@ -583,19 +622,31 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                     } else {
                         egui::Color32::from_rgb(0x88, 0x88, 0x88)
                     };
-                    if ui.button(egui::RichText::new("🔀").color(shuf_color).size(15.0)).clicked() {
+                    let shuf_tip = if app.queue.shuffle { "Shuffle on" } else { "Shuffle off" };
+                    if ui
+                        .add(egui::Button::image(Icon::Shuffle.image(shuf_color, 16.0)).frame(false))
+                        .on_hover_text(shuf_tip)
+                        .clicked()
+                    {
                         actions.push(Action::ToggleShuffle);
                     }
 
-                    let (rep_icon, rep_color) = match app.queue.repeat {
-                        Repeat::Off => ("🔁", egui::Color32::from_rgb(0x88, 0x88, 0x88)),
-                        Repeat::All => ("🔁", COLOR_TEXT_PRIMARY),
-                        Repeat::One => ("🔂", COLOR_ACCENT_RED),
+                    let (rep_icon, rep_color, rep_tip) = match app.queue.repeat {
+                        Repeat::Off => (
+                            Icon::Repeat,
+                            egui::Color32::from_rgb(0x88, 0x88, 0x88),
+                            "Repeat off",
+                        ),
+                        Repeat::All => (Icon::Repeat, COLOR_TEXT_PRIMARY, "Repeat all"),
+                        Repeat::One => (Icon::RepeatOne, COLOR_ACCENT_RED, "Repeat one"),
                     };
-                    if ui.button(egui::RichText::new(rep_icon).color(rep_color).size(15.0)).clicked() {
+                    if ui
+                        .add(egui::Button::image(rep_icon.image(rep_color, 16.0)).frame(false))
+                        .on_hover_text(rep_tip)
+                        .clicked()
+                    {
                         actions.push(Action::CycleRepeat);
                     }
-
                     ui.add_space(16.0);
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -657,6 +708,141 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                     });
                 });
             });
+        });
+}
+
+/// Right "Up next" panel: queue in play order, current highlighted, click
+/// jumps. `show_rows` keeps long queues cheap; auto-scrolls only when the
+/// current track changes.
+pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
+    let current_id = app.queue.current().map(|t| t.id.clone());
+    let order: Vec<usize> = app.queue.order.clone();
+    let tracks: Vec<Track> = app.queue.tracks.clone();
+    let order_len = order.len();
+
+    egui::Panel::right("queue_panel")
+        .exact_size(360.0)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                .fill(COLOR_BG)
+                .inner_margin(egui::Margin::same(12)),
+        )
+        .show(ui, |ui| {
+            // 1px divider on left edge
+            let left_x = ui.max_rect().left();
+            ui.painter().line_segment(
+                [
+                    egui::pos2(left_x, ui.max_rect().top()),
+                    egui::pos2(left_x, ui.max_rect().bottom()),
+                ],
+                egui::Stroke::new(1.0, COLOR_DIVIDER),
+            );
+
+            ui.label(
+                egui::RichText::new("Up next")
+                    .color(COLOR_TEXT_PRIMARY)
+                    .strong()
+                    .size(16.0),
+            );
+            ui.add_space(8.0);
+
+            let row_h = 56.0;
+            // Scroll the current row into view only when the track changed,
+            // not every frame. `show_rows` virtualizes rows, so a far-away
+            // current row has no widget to `scroll_to_me` — jump via an
+            // explicit scroll offset instead.
+            let seen_id = ui.data_mut(|d| d.get_temp::<String>(ui.id().with("queue_seen_id")));
+            let scroll_to_current = seen_id != current_id;
+            ui.data_mut(|d| {
+                if let Some(id) = current_id.clone() {
+                    d.insert_temp(ui.id().with("queue_seen_id"), id);
+                } else {
+                    d.remove_temp::<String>(ui.id().with("queue_seen_id"));
+                }
+            });
+            let spacing_y = ui.spacing().item_spacing.y;
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if scroll_to_current {
+                scroll = scroll.vertical_scroll_offset(app.queue.pos as f32 * (row_h + spacing_y));
+            }
+            scroll.show_rows(ui, row_h, order_len, |ui, range| {
+                    for pos in range {
+                        let Some(&track_idx) = order.get(pos) else {
+                            continue;
+                        };
+                        let Some(track) = tracks.get(track_idx) else {
+                            continue;
+                        };
+                        let is_current = current_id.as_deref() == Some(track.id.as_str());
+                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), row_h),
+                            egui::Sense::click(),
+                        );
+                        if is_current {
+                            ui.painter().rect_filled(
+                                row_rect,
+                                egui::CornerRadius::same(4),
+                                COLOR_SURFACE,
+                            );
+                        }
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.add_space(4.0);
+                                if let Some(url) = &track.thumb_url {
+                                    ui.add(
+                                        egui::Image::from_uri(url)
+                                            .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                                            .corner_radius(4),
+                                    );
+                                } else {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(40.0, 40.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        r,
+                                        egui::CornerRadius::same(4),
+                                        egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                                    );
+                                }
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&track.title)
+                                            .color(if is_current {
+                                                COLOR_ACCENT_RED
+                                            } else {
+                                                COLOR_TEXT_PRIMARY
+                                            })
+                                            .strong()
+                                            .size(13.0),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&track.artist)
+                                            .color(COLOR_TEXT_SECONDARY)
+                                            .size(12.0),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(format_secs(track.duration_secs))
+                                                .color(COLOR_TEXT_SECONDARY)
+                                                .size(12.0),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                        if row_resp.clicked() {
+                            actions.push(Action::Jump(pos));
+                        }
+                    }
+                });
         });
 }
 
