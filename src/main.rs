@@ -5,7 +5,7 @@ mod ui;
 use audio::{Player, Queue};
 use backend::{ArtistPage, Backend, Cmd, Collection, Event, Home, PageKind, SearchAll, Track};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use ui::{Action, Nav, View};
 
@@ -64,6 +64,38 @@ impl Settings {
     }
 }
 
+/// Last track actually started via `start_track`, for the PlayList
+/// double-click guard: one gesture starts playback once, so the second
+/// PlayList of a double-click (same track, same list shape, < 500 ms after
+/// the first) is a no-op.
+#[derive(Debug, Clone)]
+struct LastStart {
+    track_id: String,
+    list_len: usize,
+    start: usize,
+    at: Instant,
+}
+
+/// Second half of a double-click? Same track id, same list shape, within
+/// the double-click window. Pure so it is unit-testable.
+fn is_double_click_repeat(
+    last: Option<&LastStart>,
+    track_id: &str,
+    list_len: usize,
+    start: usize,
+    now: Instant,
+) -> bool {
+    match last {
+        Some(l) => {
+            l.track_id == track_id
+                && l.list_len == list_len
+                && l.start == start
+                && now.duration_since(l.at) < Duration::from_millis(500)
+        }
+        None => false,
+    }
+}
+
 /// MPRIS/media-keys command mapped onto an existing Action or direct state
 /// change. Pure so it is unit-testable.
 fn map_mpris_command(cmd: fastframe_now_playing::Command, current_id: Option<&str>) -> Option<Action> {
@@ -109,6 +141,8 @@ pub struct App {
     pub queue_open: bool,
     pub prefetched: Option<String>,
     pub radio_pending: Option<String>,
+    /// Last track actually started, for the PlayList double-click guard.
+    last_start: Option<LastStart>,
     pub now_playing: Option<fastframe_now_playing::NowPlaying>,
 
     // Page cache. Search/collection/artist maps are unbounded for the
@@ -150,6 +184,7 @@ impl App {
             queue_open: false,
             prefetched: None,
             radio_pending: None,
+            last_start: None,
             now_playing: None,
             home: None,
             home_loading: true,
@@ -172,6 +207,13 @@ impl App {
         self.is_loading = true;
         self.fetch_error = None;
         self.prefetched = None;
+        self.last_start = Some(LastStart {
+            track_id: track.id.clone(),
+            list_len: self.queue.tracks.len(),
+            // Track-space index (not order-space pos: shuffle reorders).
+            start: self.queue.order.get(self.queue.pos).copied().unwrap_or(0),
+            at: Instant::now(),
+        });
         self.backend.send(Cmd::Fetch(track));
     }
 
@@ -249,21 +291,21 @@ impl App {
                 start,
                 shuffle,
             } => {
-                let target = tracks.get(start);
-                // One gesture starts playback once: a double-click's second
-                // PlayList for the track that just started (< 1 s in) is a no-op.
-                if self.is_loading
-                    && self.queue.current().map(|t| &t.id) == target.map(|t| &t.id)
-                {
+                // One gesture starts playback once: swallow only the second
+                // half of a double-click (same track, same list shape, fast).
+                let is_dbl = match tracks.get(start) {
+                    Some(t) => is_double_click_repeat(
+                        self.last_start.as_ref(),
+                        &t.id,
+                        tracks.len(),
+                        start.min(tracks.len().saturating_sub(1)),
+                        Instant::now(),
+                    ),
+                    None => false,
+                };
+                if is_dbl {
                     return;
                 }
-                if !self.is_loading
-                    && self.queue.current().map(|t| &t.id) == target.map(|t| &t.id)
-                    && self.player.position() < Duration::from_secs(1)
-                {
-                    return;
-                }
-                self.radio_pending = None;
                 let prev_repeat = self.queue.repeat;
                 let prev_shuffle = match shuffle {
                     Some(s) => s,
@@ -301,6 +343,7 @@ impl App {
                 if self.is_loading && pos == self.queue.pos {
                     return;
                 }
+                self.radio_pending = None;
                 if let Some(track) = self.queue.jump(pos).cloned() {
                     self.start_track(track);
                 }
@@ -455,10 +498,12 @@ impl eframe::App for App {
                 }
                 Event::Radio { id, tracks } => {
                     if self.radio_pending.as_deref() != Some(id.as_str()) {
-                        return;
+                        continue;
                     }
                     self.radio_pending = None;
-                    if !tracks.is_empty() {
+                    if tracks.is_empty() {
+                        self.fetch_error = Some("Radio returned no tracks".to_string());
+                    } else {
                         let prev_repeat = self.queue.repeat;
                         let prev_shuffle = self.queue.shuffle;
                         self.queue = Queue::new(tracks, 0);
@@ -471,10 +516,9 @@ impl eframe::App for App {
                 }
                 Event::RadioError { id, error } => {
                     if self.radio_pending.as_deref() != Some(id.as_str()) {
-                        return;
+                        continue;
                     }
                     self.radio_pending = None;
-                    self.is_loading = false;
                     self.fetch_error = Some(format!("Radio failed: {error}"));
                 }
                 Event::PageError { id, kind, error } => {
@@ -818,5 +862,74 @@ mod tests {
         assert_eq!(partial.repeat, audio::Repeat::Off);
         assert!(!partial.queue_open);
         assert_eq!(partial.last_view, View::Home);
+    }
+
+    #[test]
+    fn test_double_click_repeat_guard() {
+        let t0 = Instant::now();
+        let last = LastStart {
+            track_id: "t1".to_string(),
+            list_len: 10,
+            start: 3,
+            at: t0,
+        };
+        // Second click of a double-click: same track, same list, fast.
+        assert!(is_double_click_repeat(
+            Some(&last),
+            "t1",
+            10,
+            3,
+            t0 + Duration::from_millis(100),
+        ));
+        // Replay after the queue ended (repeat off): seconds later, not
+        // within the double-click window — must go through.
+        assert!(!is_double_click_repeat(
+            Some(&last),
+            "t1",
+            10,
+            3,
+            t0 + Duration::from_secs(30),
+        ));
+        // Retry after FetchError / play_file error: same track, but the
+        // error surfaces well after the window — must go through.
+        assert!(!is_double_click_repeat(
+            Some(&last),
+            "t1",
+            10,
+            3,
+            t0 + Duration::from_secs(5),
+        ));
+        // Different list whose start track equals the current one:
+        // list length differs — must go through.
+        assert!(!is_double_click_repeat(
+            Some(&last),
+            "t1",
+            4,
+            0,
+            t0 + Duration::from_millis(100),
+        ));
+        // Same length but different start index — must go through.
+        assert!(!is_double_click_repeat(
+            Some(&last),
+            "t1",
+            10,
+            5,
+            t0 + Duration::from_millis(100),
+        ));
+        // Different track id — must go through.
+        assert!(!is_double_click_repeat(
+            Some(&last),
+            "t2",
+            10,
+            3,
+            t0 + Duration::from_millis(100),
+        ));
+        // No previous start — must go through.
+        assert!(!is_double_click_repeat(None, "t1", 10, 3, t0));
+        // ponytail: a different list with the SAME length and SAME start
+        // index and same first track id inside 500 ms is indistinguishable
+        // from a double-click and is swallowed. Cheap to accept: it needs
+        // two different Play/Shuffle gestures on identical-shape lists
+        // within half a second.
     }
 }

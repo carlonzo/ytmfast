@@ -64,35 +64,41 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     );
                                 }
 
-                                // Double-click starts playback; no single-click
-                                // fire, so one gesture starts playback once.
+                                // Double-click the row, or single-click the
+                                // thumbnail (same affordance as draw_track_row).
+                                let mut play_idx = None;
                                 if row_resp.double_clicked() {
-                                    let idx = home
-                                        .top_songs
-                                        .iter()
-                                        .position(|t| t.id == track.id)
-                                        .unwrap_or(0);
-                                    actions.push(Action::PlayList {
-                                        tracks: home.top_songs.clone(),
-                                        start: idx,
-                                        shuffle: None,
-                                    });
+                                    play_idx = Some(
+                                        home.top_songs
+                                            .iter()
+                                            .position(|t| t.id == track.id)
+                                            .unwrap_or(0),
+                                    );
                                 }
 
                                 ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
                                     ui.horizontal_centered(|ui| {
                                         ui.add_space(4.0);
+                                        let (thumb_rect, thumb_resp) = ui.allocate_exact_size(
+                                            egui::vec2(44.0, 44.0),
+                                            egui::Sense::click(),
+                                        );
+                                        if thumb_resp.clicked() {
+                                            play_idx = Some(
+                                                home.top_songs
+                                                    .iter()
+                                                    .position(|t| t.id == track.id)
+                                                    .unwrap_or(0),
+                                            );
+                                        }
                                         if let Some(url) = &track.thumb_url {
-                                            ui.add(
+                                            ui.put(
+                                                thumb_rect,
                                                 egui::Image::from_uri(url)
                                                     .fit_to_exact_size(egui::vec2(44.0, 44.0))
                                                     .corner_radius(4),
                                             );
                                         } else {
-                                            let (thumb_rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(44.0, 44.0),
-                                                egui::Sense::hover(),
-                                            );
                                             ui.painter().rect_filled(
                                                 thumb_rect,
                                                 egui::CornerRadius::same(4),
@@ -126,6 +132,13 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                         });
                                     });
                                 });
+                                if let Some(idx) = play_idx {
+                                    actions.push(Action::PlayList {
+                                        tracks: home.top_songs.clone(),
+                                        start: idx,
+                                        shuffle: None,
+                                    });
+                                }
                                 ui.add_space(4.0);
                             }
                         });

@@ -129,16 +129,25 @@ pub fn pick_top_result<'a>(
     songs: &'a [Track],
     artists: &'a [Card],
 ) -> Option<TopResult<'a>> {
-    let q_clean = query.trim().to_lowercase();
-    if !q_clean.is_empty() {
+    if !query.trim().is_empty() {
         let matched = artists
             .iter()
-            .find(|a| a.title.trim().eq_ignore_ascii_case(q_clean.as_str()));
+            .find(|a| eq_case_insensitive(a.title.trim(), query.trim()));
         if let Some(artist) = matched {
             return Some(TopResult::Artist(artist));
         }
     }
     songs.first().map(TopResult::Song)
+}
+
+/// Unicode-aware case-insensitive equality without per-frame allocation:
+/// compare `to_lowercase` char streams directly ("BJÖRK" == "björk").
+/// Not full case folding (no locale, no ß/ẞ handling) — right tradeoff for
+/// a per-frame search predicate.
+fn eq_case_insensitive(a: &str, b: &str) -> bool {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .eq(b.chars().flat_map(char::to_lowercase))
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +230,9 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
 
                 ui.add_space(12.0);
 
-                // Red "Music" Logo (red circle with white play triangle + text)
+                // Red "Music" Logo (red circle with white play triangle + text).
+                // `interact(Sense::click())`: the raw horizontal response only
+                // senses hover, so upgrade it to a click target.
                 let logo_resp = ui
                     .horizontal(|ui| {
                         let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
@@ -243,7 +254,8 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                                 .size(22.0),
                         );
                     })
-                    .response;
+                    .response
+                    .interact(egui::Sense::click());
 
                 if logo_resp.clicked() {
                     actions.push(Action::Navigate(View::Home));
@@ -699,6 +711,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                             }
                             ui.add_space(8.0);
                             ui.vertical(|ui| {
+                                ui.set_max_width(ui.available_width().max(0.0));
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::Label::new(
@@ -742,6 +755,15 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                                     );
                                 }
                             });
+                        } else if let Some(err) = &app.fetch_error {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(err)
+                                        .color(egui::Color32::from_rgb(0xFF, 0x44, 0x44))
+                                        .size(11.0),
+                                )
+                                .truncate(),
+                            );
                         }
                     });
                 });
@@ -789,14 +811,17 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
             ui.add_space(8.0);
 
             let row_h = 56.0;
-            // Scroll the current row into view only when the position
-            // changed, not every frame. `show_rows` virtualizes rows, so a
-            // far-away current row has no widget to `scroll_to_me` — jump
-            // via an explicit scroll offset instead.
-            let seen_pos = ui.data_mut(|d| d.get_temp::<usize>(ui.id().with("queue_seen_pos")));
-            let scroll_to_current = seen_pos != Some(current_pos);
+            // Scroll the current row into view only when the current track
+            // changes, not every frame. Key on (pos, track id): a NEW queue
+            // starting at the same position must still scroll. `show_rows`
+            // virtualizes rows, so a far-away current row has no widget to
+            // `scroll_to_me` — jump via an explicit scroll offset instead.
+            let seen_key = (current_pos, app.queue.current().map(|t| t.id.clone()));
+            let seen: Option<(usize, Option<String>)> =
+                ui.data_mut(|d| d.get_temp(ui.id().with("queue_seen")));
+            let scroll_to_current = seen.as_ref() != Some(&seen_key);
             ui.data_mut(|d| {
-                d.insert_temp(ui.id().with("queue_seen_pos"), current_pos);
+                d.insert_temp(ui.id().with("queue_seen"), seen_key);
             });
             let spacing_y = ui.spacing().item_spacing.y;
             let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
@@ -844,7 +869,21 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                                     );
                                 }
                                 ui.add_space(8.0);
+                                // Duration first so the title truncates against it
+                                // instead of under it (360 px panel, long titles).
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(format_secs(track.duration_secs))
+                                                .color(COLOR_TEXT_SECONDARY)
+                                                .size(12.0),
+                                        );
+                                    },
+                                );
                                 ui.vertical(|ui| {
+                                    ui.set_max_width(ui.available_width().max(0.0));
                                     ui.add_space(6.0);
                                     ui.add(
                                         egui::Label::new(
@@ -868,17 +907,6 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                                         .truncate(),
                                     );
                                 });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            egui::RichText::new(format_secs(track.duration_secs))
-                                                .color(COLOR_TEXT_SECONDARY)
-                                                .size(12.0),
-                                        );
-                                    },
-                                );
                             });
                         });
                         if row_resp.clicked() {
@@ -1085,7 +1113,34 @@ pub fn draw_track_row(
                 ui.add_space(8.0);
             }
 
-            // Title & Artist
+            // Right edge first: duration (and album) claim their width before
+            // the truncating title column takes the rest. Otherwise the title
+            // grabs the whole row and the duration draws over its tail.
+            let show_album_col =
+                config.show_album && row_width > 600.0 && !track.album.is_empty();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(16.0);
+                let dur = format_secs(track.duration_secs);
+                ui.label(
+                    egui::RichText::new(dur)
+                        .color(COLOR_TEXT_SECONDARY)
+                        .size(13.0),
+                );
+                if show_album_col {
+                    ui.add_space(32.0);
+                    ui.add_sized(
+                        [180.0, 20.0],
+                        egui::Label::new(
+                            egui::RichText::new(&track.album)
+                                .color(COLOR_TEXT_SECONDARY)
+                                .size(13.0),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
+
+            // Title & Artist take the remaining width.
             let title_color = if is_current {
                 COLOR_ACCENT_RED
             } else {
@@ -1093,6 +1148,7 @@ pub fn draw_track_row(
             };
 
             ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width().max(0.0));
                 ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
@@ -1110,30 +1166,6 @@ pub fn draw_track_row(
                             .size(12.0),
                     )
                     .truncate(),
-                );
-            });
-
-            // Album column (if broad enough and requested)
-            if config.show_album && row_width > 600.0 && !track.album.is_empty() {
-                ui.add_space(32.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&track.album)
-                            .color(COLOR_TEXT_SECONDARY)
-                            .size(13.0),
-                    )
-                    .truncate(),
-                );
-            }
-
-            // Duration right aligned
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(16.0);
-                let dur = format_secs(track.duration_secs);
-                ui.label(
-                    egui::RichText::new(dur)
-                        .color(COLOR_TEXT_SECONDARY)
-                        .size(13.0),
                 );
             });
         });
@@ -1277,5 +1309,29 @@ mod tests {
 
         // Both empty -> None
         assert_eq!(pick_top_result("test", &[], &[]), None);
+    }
+
+    #[test]
+    fn test_pick_top_result_non_ascii_case() {
+        let songs: Vec<Track> = vec![];
+        let artists = vec![Card {
+            kind: CardKind::Artist,
+            id: "artist_bjork".to_string(),
+            title: "BJÖRK".to_string(),
+            subtitle: "Artist".to_string(),
+            thumb_url: None,
+        }];
+        // eq_ignore_ascii_case would fail on Ö/ö; the char-stream compare
+        // must still match.
+        assert_eq!(
+            pick_top_result("björk", &songs, &artists),
+            Some(TopResult::Artist(&artists[0]))
+        );
+        assert_eq!(
+            pick_top_result("  BJÖRK ", &songs, &artists),
+            Some(TopResult::Artist(&artists[0]))
+        );
+        assert!(eq_case_insensitive("BJÖRK", "björk"));
+        assert!(!eq_case_insensitive("björk", "bjork"));
     }
 }
