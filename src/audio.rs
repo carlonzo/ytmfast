@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use crate::backend::Track;
 
@@ -333,9 +334,38 @@ fn output_stalled(last: &mut (Duration, Instant), pos: Duration, playing: bool, 
     now.duration_since(last.1) >= STALL_TIMEOUT
 }
 
+/// How often the system default output device is compared with the open one.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+fn default_device_id() -> Option<rodio::cpal::DeviceId> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host().default_output_device()?.id().ok()
+}
+
+/// Opens the default output. `lost` is set from the audio thread when the
+/// system reports that the device is gone or the stream must be rebuilt.
+fn open_output(lost: Arc<AtomicBool>) -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
+    use rodio::cpal::StreamError;
+    rodio::DeviceSinkBuilder::from_default_device()
+        .and_then(|b| {
+            b.with_error_callback(move |e| {
+                eprintln!("audio stream error: {e}");
+                if matches!(e, StreamError::DeviceNotAvailable | StreamError::StreamInvalidated) {
+                    lost.store(true, Ordering::Relaxed);
+                }
+            })
+            .open_sink_or_fallback()
+        })
+        // Last resort: any other usable device, without loss reporting.
+        .or_else(|_| rodio::DeviceSinkBuilder::open_default_sink())
+}
+
 pub struct Player {
     current_path: Option<PathBuf>,
     last_progress: (Duration, Instant),
+    device_lost: Arc<AtomicBool>,
+    device_id: Option<rodio::cpal::DeviceId>,
+    last_device_check: Instant,
     sink: Option<rodio::MixerDeviceSink>,
     player: Option<rodio::Player>,
     volume: f32,
@@ -346,35 +376,44 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Self {
-        let (sink, error) = match rodio::DeviceSinkBuilder::open_default_sink() {
-            Ok(sink) => (Some(sink), None),
-            Err(e) => (None, Some(format!("Audio output device error: {e}"))),
-        };
-        Self {
+        let mut player = Self {
             current_path: None,
             last_progress: (Duration::ZERO, Instant::now()),
-            sink,
+            device_lost: Arc::default(),
+            device_id: None,
+            last_device_check: Instant::now(),
+            sink: None,
             player: None,
             volume: 1.0,
             current_duration: None,
             has_source: false,
-            error,
+            error: None,
+        };
+        if let Err(e) = player.open() {
+            player.error = Some(format!("Audio output device error: {e}"));
         }
+        player
+    }
+
+    /// (Re)opens the system default output and remembers which device it is.
+    fn open(&mut self) -> Result<(), String> {
+        // Drop the old stream first. A fresh flag, so a late error from the
+        // old stream cannot mark the new one as lost.
+        self.sink = None;
+        self.device_lost = Arc::default();
+        self.device_id = default_device_id();
+        self.last_device_check = Instant::now();
+        self.sink = Some(open_output(self.device_lost.clone()).map_err(|e| e.to_string())?);
+        Ok(())
     }
 
     pub fn play_file(&mut self, path: &Path) -> Result<(), String> {
-        if self.sink.is_none() {
-            match rodio::DeviceSinkBuilder::open_default_sink() {
-                Ok(s) => {
-                    self.sink = Some(s);
-                    self.error = None;
-                }
-                Err(e) => {
-                    let err = format!("No audio output device: {e}");
-                    self.error = Some(err.clone());
-                    return Err(err);
-                }
-            }
+        if self.sink.is_none()
+            && let Err(e) = self.open()
+        {
+            let err = format!("No audio output device: {e}");
+            self.error = Some(err.clone());
+            return Err(err);
         }
         let sink = self.sink.as_ref().unwrap();
 
@@ -399,23 +438,42 @@ impl Player {
         Ok(())
     }
 
-    /// Call regularly while playing. The output stream is bound to the device
-    /// it was opened on; when that device goes away the stream stops pulling
-    /// samples and never recovers. Detect that as a stalled position and
-    /// reopen the current default device, resuming where playback stopped.
-    pub fn recover_if_stalled(&mut self) {
-        let Some(p) = &self.player else { return };
-        let pos = p.get_pos();
-        let playing = self.has_source && !p.is_paused() && !p.empty();
-        if !output_stalled(&mut self.last_progress, pos, playing, Instant::now()) {
+    /// Call regularly. The output stream is bound to the device it was opened
+    /// on and does not follow the system. Reopen it on the current default
+    /// device, resuming where playback was, when the system reports the device
+    /// gone, when the default output changed, or (fallback for backends that
+    /// report neither) when the position stopped moving during playback.
+    pub fn recover_output(&mut self) {
+        let now = Instant::now();
+        let mut changed = self.device_lost.load(Ordering::Relaxed);
+        if !changed && now.duration_since(self.last_device_check) >= DEVICE_CHECK_INTERVAL {
+            self.last_device_check = now;
+            let id = default_device_id();
+            changed = id.is_some() && id != self.device_id;
+        }
+        let (pos, paused, resume) = match &self.player {
+            Some(p) => (p.get_pos(), p.is_paused(), self.has_source && !p.empty()),
+            None => (Duration::ZERO, true, false),
+        };
+        let stalled = output_stalled(&mut self.last_progress, pos, resume && !paused, now);
+        if !changed && !stalled {
             return;
         }
-        let Some(path) = self.current_path.clone() else { return };
-        // Drop the dead stream before opening the new one.
+        let path = self.current_path.clone().filter(|_| resume);
+        let Some(path) = path else {
+            // Nothing to resume (a finished player is kept for is_finished).
+            let _ = self.open();
+            return;
+        };
         self.player = None;
         self.sink = None;
-        if self.play_file(&path).is_ok() {
-            self.seek(pos);
+        if self.play_file(&path).is_err() {
+            self.stop();
+            return;
+        }
+        self.seek(pos);
+        if paused && let Some(p) = &self.player {
+            p.pause();
         }
     }
 

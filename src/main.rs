@@ -824,7 +824,7 @@ impl eframe::App for App {
         if self.is_loading || (self.is_active_playback && !self.player.is_paused()) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        self.player.recover_if_stalled();
+        self.player.recover_output();
         if self.is_active_playback
             && !self.is_loading
             && !self.player.is_paused()
