@@ -305,7 +305,7 @@ mod tests {
     fn test_import_args_rejects_non_allowlisted() {
         let out = Path::new("/tmp/cookies.txt");
         assert_eq!(import_args("firefox; rm -rf", out), None);
-        assert_eq!(import_args("safari", out), None);
+        assert_eq!(import_args("edge", out), None);
         assert_eq!(import_args("", out), None);
         assert_eq!(import_args("Firefox", out), None);
         assert_eq!(import_args(" firefox", out), None);
