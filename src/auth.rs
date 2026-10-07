@@ -5,7 +5,10 @@ use crate::backend::{Card, CardKind, Track};
 
 /// Browsers accepted for `--cookies-from-browser`. Kept small on purpose:
 /// passed as an argv element, never through a shell.
+#[cfg(not(target_os = "macos"))]
 pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome"];
+#[cfg(target_os = "macos")]
+pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome", "safari"];
 
 /// Reject user-typed cookie files larger than this (checked via metadata first).
 pub const MAX_COOKIE_FILE_BYTES: u64 = 1024 * 1024;
