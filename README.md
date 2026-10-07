@@ -1,6 +1,6 @@
 # ytmfast
 
-A small, fast, native YouTube Music client for Linux, written in Rust with
+A small, fast, native YouTube Music client for Linux and macOS, written in Rust with
 [egui](https://github.com/emilk/egui). Inspired by
 [spotifast](https://github.com/crmne/spotifast) and styled after
 music.youtube.com.
@@ -17,7 +17,8 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 
 ## Requirements
 
-- Linux (x86_64 or arm64), Wayland or X11, ALSA/PipeWire audio
+- Linux (x86_64 or arm64), Wayland or X11, ALSA/PipeWire audio; or macOS on
+  Apple Silicon (builds and passes tests in CI, otherwise untested)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on `PATH`, kept up to date. It
   fetches the audio; recent versions also need a JavaScript runtime such as
   `deno`.
@@ -33,9 +34,13 @@ tar -xzf ytmfast-*.tar.gz
 install -Dm755 ytmfast ~/.local/bin/ytmfast
 ```
 
+The macOS binary is not signed. If you downloaded it with a browser, clear the
+quarantine flag before running it: `xattr -d com.apple.quarantine ytmfast`.
+
 ## Build from source
 
-Needs a recent stable Rust toolchain and, on Debian/Ubuntu:
+Needs a recent stable Rust toolchain. On Debian/Ubuntu install the system
+packages first; macOS needs none:
 
 ```sh
 sudo apt install pkg-config libasound2-dev libssl-dev libxkbcommon-dev libwayland-dev
@@ -64,6 +69,8 @@ treat that file like a password.
 
 ## Files
 
+On Linux (macOS uses the matching folders under `~/Library`):
+
 | Path | Contents |
 | --- | --- |
 | `~/.config/ytmfast/` | Cookies (only when signed in) |
@@ -72,8 +79,8 @@ treat that file like a password.
 
 ## Releasing
 
-Push a tag starting with `v`; the release workflow builds both architectures
-and attaches the binaries to a GitHub release:
+Push a tag starting with `v`; the release workflow builds Linux x86_64, Linux arm64
+and macOS arm64 and attaches the binaries to a GitHub release:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
