@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use crate::backend::Track;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -319,7 +319,23 @@ pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> 
     unreachable!()
 }
 
+/// How long the position may stand still during playback before the output
+/// device is considered gone (unplugged, Bluetooth disconnected).
+const STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// True once `pos` has not moved for `STALL_TIMEOUT` while playing.
+/// `last` holds the last position seen and when it was first seen.
+fn output_stalled(last: &mut (Duration, Instant), pos: Duration, playing: bool, now: Instant) -> bool {
+    if !playing || pos != last.0 {
+        *last = (pos, now);
+        return false;
+    }
+    now.duration_since(last.1) >= STALL_TIMEOUT
+}
+
 pub struct Player {
+    current_path: Option<PathBuf>,
+    last_progress: (Duration, Instant),
     sink: Option<rodio::MixerDeviceSink>,
     player: Option<rodio::Player>,
     volume: f32,
@@ -335,6 +351,8 @@ impl Player {
             Err(e) => (None, Some(format!("Audio output device error: {e}"))),
         };
         Self {
+            current_path: None,
+            last_progress: (Duration::ZERO, Instant::now()),
             sink,
             player: None,
             volume: 1.0,
@@ -376,7 +394,29 @@ impl Player {
         self.player = Some(new_player);
         self.has_source = true;
         self.error = None;
+        self.current_path = Some(path.to_path_buf());
+        self.last_progress = (Duration::ZERO, Instant::now());
         Ok(())
+    }
+
+    /// Call regularly while playing. The output stream is bound to the device
+    /// it was opened on; when that device goes away the stream stops pulling
+    /// samples and never recovers. Detect that as a stalled position and
+    /// reopen the current default device, resuming where playback stopped.
+    pub fn recover_if_stalled(&mut self) {
+        let Some(p) = &self.player else { return };
+        let pos = p.get_pos();
+        let playing = self.has_source && !p.is_paused() && !p.empty();
+        if !output_stalled(&mut self.last_progress, pos, playing, Instant::now()) {
+            return;
+        }
+        let Some(path) = self.current_path.clone() else { return };
+        // Drop the dead stream before opening the new one.
+        self.player = None;
+        self.sink = None;
+        if self.play_file(&path).is_ok() {
+            self.seek(pos);
+        }
     }
 
     pub fn toggle_pause(&mut self) {
@@ -424,6 +464,7 @@ impl Player {
         }
         self.has_source = false;
         self.current_duration = None;
+        self.current_path = None;
     }
 
     pub fn is_finished(&mut self) -> bool {
@@ -454,6 +495,20 @@ mod tests {
                 album_id: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn test_output_stalled() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut last = (s(0), t0);
+        assert!(!output_stalled(&mut last, s(5), true, t0));
+        assert!(!output_stalled(&mut last, s(5), true, t0 + s(1)));
+        assert!(output_stalled(&mut last, s(5), true, t0 + s(2)));
+        // Progress or a pause resets the timer.
+        assert!(!output_stalled(&mut last, s(6), true, t0 + s(3)));
+        assert!(!output_stalled(&mut last, s(6), false, t0 + s(9)));
+        assert!(!output_stalled(&mut last, s(6), true, t0 + s(10)));
     }
 
     #[test]
