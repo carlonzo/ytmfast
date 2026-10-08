@@ -1,4 +1,5 @@
 pub mod library;
+pub mod lyrics;
 pub mod pages;
 
 use std::time::Duration;
@@ -35,6 +36,7 @@ fastframe_icons::icons! {
         Repeat => "repeat",
         RepeatOne => "repeat-1",
         Queue => "list-music",
+        Lyrics => "mic-vocal",
         Volume => lucide "volume-2",
         VolumeMute => lucide "volume-x",
         Plus => lucide "plus",
@@ -186,6 +188,8 @@ pub enum Action {
     SetRepeat(crate::audio::Repeat),
     Jump(usize),
     ToggleQueue,
+    ToggleLyrics,
+    RetryLyrics,
     Resume,
     Pause,
     SeekRelative(i64),
@@ -743,7 +747,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
 
-                    // Right-to-left order on screen: volume, repeat, shuffle, queue.
+                    // Right-to-left order on screen: volume, repeat, shuffle, lyrics, queue.
                     let queue_color = if app.queue_open {
                         COLOR_ACCENT_RED
                     } else {
@@ -759,6 +763,20 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                         .clicked()
                     {
                         actions.push(Action::ToggleQueue);
+                    }
+                    ui.add_space(8.0);
+
+                    let lyrics_color = if app.lyrics_open {
+                        COLOR_ACCENT_RED
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    };
+                    if ui
+                        .add(egui::Button::image(Icon::Lyrics.image(lyrics_color, 18.0)).frame(false))
+                        .on_hover_text("Lyrics")
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleLyrics);
                     }
                     ui.add_space(8.0);
 

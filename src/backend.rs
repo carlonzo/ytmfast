@@ -101,6 +101,7 @@ pub enum Cmd {
     OpenArtist(String, u64),
     Radio(String),
     Fetch(Track),
+    Lyrics(Track),
     Prefetch(Track),
     SetCachePolicy { max_bytes: u64, protect: HashSet<String> },
     EnforceCache { max_bytes: u64, protect: HashSet<String> },
@@ -113,6 +114,7 @@ pub enum Cmd {
 
 pub enum Event {
     Home(Home),
+    Lyrics { id: String, result: Result<Option<crate::lyrics::Lyrics>, String> },
     HomeError(String),
     SearchResults(SearchAll),
     SearchError { query: String, error: String },
@@ -509,6 +511,54 @@ async fn fail_auth(
     ctx.request_repaint();
 }
 
+fn is_not_found(e: &rustypipe::error::Error) -> bool {
+    matches!(
+        e,
+        rustypipe::error::Error::Extraction(rustypipe::error::ExtractionError::NotFound { .. })
+    )
+}
+
+async fn fetch_lyrics(
+    http: &Result<reqwest::Client, String>,
+    rp: Option<&Arc<rustypipe::client::RustyPipe>>,
+    track: &Track,
+) -> Result<Option<crate::lyrics::Lyrics>, String> {
+    let cache_dir = directories::BaseDirs::new()
+        .map(|b| b.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = crate::lyrics::cache_path(&cache_dir, &track.id)?;
+    if let Some(found) = crate::lyrics::cached(&path).await {
+        return Ok(found);
+    }
+    let http = http.as_ref().map_err(Clone::clone)?;
+    let query = crate::lyrics::Query {
+        artist: track.artist.clone(),
+        title: track.title.clone(),
+        album: track.album.clone(),
+        duration_ms: track.duration_secs.saturating_mul(1000),
+    };
+    let mut found = crate::lyrics::lookup(http, &query).await?;
+    if found.is_none() {
+        let Some(rp) = rp else {
+            return Ok(None);
+        };
+        let lyrics_id = match authed_query(rp).music_details(&track.id).await {
+            Ok(details) => details.lyrics_id,
+            Err(e) if is_not_found(&e) => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        if let Some(id) = lyrics_id {
+            match authed_query(rp).music_lyrics(&id).await {
+                Ok(lyrics) => found = crate::lyrics::from_youtube(&lyrics.body),
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    crate::lyrics::store(&path, &found).await;
+    Ok(found)
+}
+
 impl Backend {
     pub fn new(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -591,6 +641,8 @@ impl Backend {
                 let _ = rt.block_on(rp.user_auth_remove_cookie());
             }
             let _guard = rt.as_ref().map(|r| r.enter());
+            let lyrics_http = reqwest::Client::builder().timeout(Duration::from_secs(10))
+                .build().map_err(|e| format!("Lyrics HTTP client init error: {e}"));
             let prefetch_slots = Arc::new(tokio::sync::Semaphore::new(2));
             let cache_policy = Arc::new(Mutex::new(CachePolicy {
                 max_bytes: 2048 * 1024 * 1024,
@@ -616,6 +668,7 @@ impl Backend {
                 let prefetch_slots = prefetch_slots.clone();
                 let event_tx = event_tx.clone();
                 let ctx = ctx.clone();
+                let lyrics_http = lyrics_http.clone();
                 let rp = rp.clone();
                 let rp_err = rp_err.clone();
                 let rt_err = rt_err.clone();
@@ -625,6 +678,11 @@ impl Backend {
                 if let Some(rt_ref) = &rt {
                     rt_ref.spawn(async move {
                         match cmd {
+                            Cmd::Lyrics(track) => {
+                                let result = fetch_lyrics(&lyrics_http, rp.as_ref(), &track).await;
+                                let _ = event_tx.send(Event::Lyrics { id: track.id, result });
+                                ctx.request_repaint();
+                            }
                             Cmd::LoadHome => {
                                 if let Some(rp) = rp {
                                     let q1 = rp.query();
@@ -1319,6 +1377,9 @@ impl Backend {
                         Cmd::Radio(id) => {
                             let _ = event_tx.send(Event::RadioError { id, error: err });
                         }
+                        Cmd::Lyrics(track) => {
+                            let _ = event_tx.send(Event::Lyrics { id: track.id, result: Err(err) });
+                        }
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
                         }
@@ -1367,6 +1428,23 @@ impl Backend {
 mod tests {
     use super::*;
     use rustypipe::model::Thumbnail;
+
+    #[test]
+    fn only_extraction_not_found_is_a_lyrics_miss() {
+        use rustypipe::error::{Error, ExtractionError};
+
+        for id in ["dQw4w9WgXcQ", "MPLYt_missing"] {
+            assert!(is_not_found(&Error::Extraction(ExtractionError::NotFound {
+                id: id.into(),
+                msg: "Lyrics not available".into(),
+            })));
+        }
+        assert!(!is_not_found(&Error::Extraction(ExtractionError::InvalidData(
+            "bad response".into(),
+        ))));
+        assert!(!is_not_found(&Error::Http("connection failed".into())));
+        assert!(!is_not_found(&Error::HttpStatus(404, "not found".into())));
+    }
 
     #[test]
     fn test_in_flight_fetch_join_stays_protected_until_both_finish() {

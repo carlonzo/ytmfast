@@ -9,6 +9,7 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 
 ## Features
 
+- Synced lyrics from LRCLIB (fallback: YouTube Music)
 - Home, Explore, search (songs, albums, artists, playlists), album, artist and
   playlist pages
 - Playback with queue, shuffle, repeat and prefetch of the next track
