@@ -23,6 +23,9 @@ pub struct Settings {
     pub repeat: audio::Repeat,
     pub queue_open: bool,
     pub last_view: View,
+    pub cache_max_mb: u32,
+    #[serde(deserialize_with = "deserialize_prefetch_count")]
+    pub prefetch_count: u8,
 }
 
 impl Default for Settings {
@@ -34,8 +37,14 @@ impl Default for Settings {
             repeat: audio::Repeat::Off,
             queue_open: false,
             last_view: View::Home,
+            cache_max_mb: 2048,
+            prefetch_count: 3,
         }
     }
+}
+
+fn deserialize_prefetch_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    u8::deserialize(deserializer).map(|n| n.min(10))
 }
 
 impl Settings {
@@ -55,6 +64,8 @@ impl Settings {
             repeat: app.queue.repeat,
             queue_open: app.queue_open,
             last_view: Self::sanitize_view(app.nav.current.clone()),
+            cache_max_mb: app.cache_max_mb,
+            prefetch_count: app.prefetch_count,
         }
     }
 
@@ -64,6 +75,10 @@ impl Settings {
         app.queue.shuffle = self.shuffle;
         app.queue.repeat = self.repeat;
         app.queue_open = self.queue_open;
+        app.cache_max_mb = self.cache_max_mb;
+        app.sent_cache_max_mb = self.cache_max_mb;
+        app.prefetch_count = self.prefetch_count.min(10);
+        app.update_cache_policy();
         // Signed-in state comes from disk + rustypipe, not Settings: a
         // restored private view while signed out would show a broken page.
         // Album/Artist pages are public, so only Library and Playlist fall
@@ -175,6 +190,18 @@ fn is_double_click_repeat(
     }
 }
 
+fn cache_protection(queue: &Queue, prefetched: &HashSet<String>, n: usize, loading: bool) -> HashSet<String> {
+    let mut protect = prefetched.clone();
+    if let Some(track) = queue.current() {
+        protect.insert(track.id.clone());
+    }
+    // Keep upcoming cached files through loading so a zero cap does not evict them on advance.
+    if loading {
+        protect.extend(queue.peek_ahead(n).into_iter().map(|track| track.id.clone()));
+    }
+    protect
+}
+
 /// MPRIS/media-keys command mapped onto an existing Action or direct state
 /// change. Pure so it is unit-testable.
 fn map_mpris_command(cmd: fastframe_now_playing::Command, current_id: Option<&str>) -> Option<Action> {
@@ -218,7 +245,15 @@ pub struct App {
     pub fetch_error: Option<String>,
     pub is_active_playback: bool,
     pub queue_open: bool,
-    pub prefetched: Option<String>,
+    pub prefetched: HashSet<String>,
+    // ponytail: bounded by IDs hovered in this session; evict the set if sessions grow huge.
+    hover_prefetched: HashSet<String>,
+    pub cache_max_mb: u32,
+    sent_cache_max_mb: u32,
+    sent_cache_policy: Option<(u64, HashSet<String>)>,
+    pub prefetch_count: u8,
+    pub show_settings: bool,
+    pub cache_usage: Option<(u64, usize)>,
     pub radio_pending: Option<String>,
     /// Transient radio failure notice with its timestamp: shown in the
     /// player bar but auto-expires after `RADIO_ERROR_TTL` so it never
@@ -288,7 +323,14 @@ impl App {
             fetch_error,
             is_active_playback: false,
             queue_open: false,
-            prefetched: None,
+            prefetched: HashSet::new(),
+            hover_prefetched: HashSet::new(),
+            cache_max_mb: 2048,
+            sent_cache_max_mb: 2048,
+            sent_cache_policy: None,
+            prefetch_count: 3,
+            show_settings: false,
+            cache_usage: None,
             radio_pending: None,
             radio_error: None,
             last_start: None,
@@ -325,7 +367,8 @@ impl App {
         self.is_active_playback = true;
         self.is_loading = true;
         self.fetch_error = None;
-        self.prefetched = None;
+        self.prefetched.clear();
+        self.update_cache_policy();
         self.radio_error = None;
         self.last_start = Some(LastStart {
             track_id: track.id.clone(),
@@ -348,14 +391,35 @@ impl App {
         })
     }
 
-    /// Send Prefetch for the likely-next track, at most once per id.
-    fn maybe_prefetch(&mut self) {
-        if !self.is_active_playback || self.is_loading {
+    pub fn cache_protect(&self) -> HashSet<String> {
+        cache_protection(&self.queue, &self.prefetched, self.prefetch_count as usize, self.is_loading)
+    }
+
+    fn update_cache_policy(&mut self) {
+        let max_bytes = u64::from(self.sent_cache_max_mb) * 1024 * 1024;
+        let protect = self.cache_protect();
+        if self.sent_cache_policy.as_ref().is_some_and(|(sent_max, sent_protect)| {
+            *sent_max == max_bytes && *sent_protect == protect
+        }) {
             return;
         }
-        if let Some(next) = audio::prefetch_target(&self.queue, self.prefetched.as_deref()) {
-            self.prefetched = Some(next.id.clone());
-            self.backend.send(Cmd::Prefetch(next));
+        self.backend.send(Cmd::SetCachePolicy {
+            max_bytes,
+            protect: protect.clone(),
+        });
+        self.sent_cache_policy = Some((max_bytes, protect));
+    }
+
+    fn maybe_prefetch(&mut self) {
+        if !self.is_active_playback || self.is_loading {
+            self.update_cache_policy();
+            return;
+        }
+        let targets = audio::prefetch_targets(&self.queue, self.prefetch_count as usize, &self.prefetched);
+        self.prefetched.extend(targets.iter().map(|t| t.id.clone()));
+        self.update_cache_policy();
+        for track in targets {
+            self.backend.send(Cmd::Prefetch(track));
         }
     }
 
@@ -366,6 +430,7 @@ impl App {
             self.is_active_playback = false;
             self.is_loading = false;
             self.player.stop();
+            self.update_cache_policy();
         }
     }
 
@@ -424,6 +489,43 @@ impl App {
 
     fn apply_action(&mut self, action: Action) {
         match action {
+            Action::Prefetch(track) => {
+                if !self.prefetched.contains(&track.id) && self.hover_prefetched.insert(track.id.clone()) {
+                    self.backend.send(Cmd::Prefetch(track));
+                }
+            }
+            Action::ShowSettings => {
+                self.show_settings = true;
+                self.cache_usage = None;
+                self.backend.send(Cmd::CacheUsage);
+            }
+            Action::SetPrefetchCount(count) => {
+                if self.prefetch_count != count {
+                    self.prefetch_count = count.min(10);
+                    let ahead: HashSet<_> = self.queue.peek_ahead(self.prefetch_count as usize)
+                        .into_iter().map(|track| track.id.clone()).collect();
+                    self.prefetched.retain(|id| ahead.contains(id));
+                    self.maybe_prefetch();
+                }
+            }
+            Action::SetCacheMaxMb(mb) => {
+                self.cache_max_mb = mb;
+                if self.sent_cache_max_mb != mb {
+                    self.sent_cache_max_mb = mb;
+                    let max_bytes = u64::from(mb) * 1024 * 1024;
+                    let protect = self.cache_protect();
+                    self.backend.send(Cmd::EnforceCache {
+                        max_bytes,
+                        protect: protect.clone(),
+                    });
+                    self.sent_cache_policy = Some((max_bytes, protect));
+                }
+            }
+            Action::ClearCache => {
+                self.cache_usage = None;
+                self.hover_prefetched.clear();
+                self.backend.send(Cmd::ClearCache { protect: self.cache_protect() });
+            }
             Action::PlayList {
                 tracks,
                 start,
@@ -455,11 +557,14 @@ impl App {
                     Some(s) => s,
                     None => self.queue.shuffle,
                 };
+                self.prefetched.clear();
                 self.queue = Queue::new(tracks, start);
                 self.queue.repeat = prev_repeat;
                 self.queue.set_shuffle(prev_shuffle);
                 if let Some(track) = self.queue.current().cloned() {
                     self.start_track(track);
+                } else {
+                    self.update_cache_policy();
                 }
             }
             Action::TogglePlayPause => {
@@ -472,15 +577,18 @@ impl App {
                     self.is_active_playback = false;
                     self.is_loading = false;
                     self.player.stop();
+                    self.update_cache_policy();
                 }
             }
             Action::ToggleShuffle => {
                 let new_shuf = !self.queue.shuffle;
                 self.queue.set_shuffle(new_shuf);
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::CycleRepeat => {
                 self.queue.cycle_repeat();
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::Jump(pos) => {
@@ -496,11 +604,15 @@ impl App {
                 self.queue_open = !self.queue_open;
             }
             Action::SetShuffle(s) => {
+                if self.queue.shuffle == s { return; }
                 self.queue.set_shuffle(s);
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::SetRepeat(r) => {
+                if self.queue.repeat == r { return; }
                 self.queue.repeat = r;
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::Resume => {
@@ -701,6 +813,7 @@ impl eframe::App for App {
                     } else {
                         let prev_repeat = self.queue.repeat;
                         let prev_shuffle = self.queue.shuffle;
+                        self.prefetched.clear();
                         self.queue = Queue::new(tracks, 0);
                         self.queue.repeat = prev_repeat;
                         self.queue.set_shuffle(prev_shuffle);
@@ -731,11 +844,16 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Event::CacheUsage { bytes, files } => {
+                    self.cache_usage = Some((bytes, files));
+                }
                 Event::Ready { id, path } => {
                     if self.is_loading
                         && self.queue.current().map(|t| t.id.as_str()) == Some(&id)
                     {
                         self.is_loading = false;
+                        let _ = std::fs::File::options().write(true).open(&path)
+                            .and_then(|file| file.set_modified(std::time::SystemTime::now()));
                         if let Err(e) = self.player.play_file(&path) {
                             self.fetch_error = Some(e);
                         } else {
@@ -750,6 +868,7 @@ impl eframe::App for App {
                     {
                         self.is_loading = false;
                         self.fetch_error = Some(msg);
+                        self.maybe_prefetch();
                     }
                 }
                 Event::Auth { signed_in, error } => {
@@ -867,6 +986,7 @@ impl eframe::App for App {
         }
         ui::draw_central_panel(ui, self, &mut actions);
         ui::draw_sign_in_dialog(ui, self, &mut actions);
+        ui::draw_settings_dialog(ui, self, &mut actions);
 
         // Apply actions (Raise/Quit need the viewport, so handle inline)
         let mut viewport_cmds = Vec::new();
@@ -1021,9 +1141,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_protection_survives_loading_transition() {
+        let tracks = (0..5).map(|i| Track {
+            id: format!("test_id_{i:04}"),
+            title: String::new(), artist: String::new(), album: String::new(),
+            duration_secs: 0, thumb_url: None, artist_id: None, album_id: None,
+        }).collect();
+        let mut queue = Queue::new(tracks, 1);
+        let empty = HashSet::new();
+        // Advance cleared requests: retain the current and next two files until Ready.
+        assert_eq!(cache_protection(&queue, &empty, 2, true),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0002".to_owned(), "test_id_0003".to_owned()]));
+        let current = HashSet::from(["test_id_0001".to_owned()]);
+        assert_eq!(cache_protection(&queue, &empty, 0, true), current);
+        assert_eq!(cache_protection(&queue, &empty, 2, false), current);
+        let prefetched = HashSet::from(["test_id_0002".to_owned()]);
+        assert_eq!(cache_protection(&queue, &prefetched, 2, false),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0002".to_owned()]));
+        queue.order = vec![1, 4, 0, 3, 2];
+        queue.pos = 0;
+        assert_eq!(cache_protection(&queue, &empty, 2, true),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0004".to_owned(), "test_id_0000".to_owned()]));
+        queue.repeat = audio::Repeat::One;
+        assert_eq!(cache_protection(&queue, &empty, 2, true), current);
+        assert!(cache_protection(&Queue::new(Vec::new(), 0), &empty, 2, true).is_empty());
+    }
+
+    #[test]
     fn test_settings_default_volume() {
         let s = Settings::default();
         assert_eq!(s.volume, 1.0);
+        assert_eq!(s.cache_max_mb, 2048);
+        assert_eq!(s.prefetch_count, 3);
         assert!(!s.sidebar_collapsed);
         assert!(!s.shuffle);
         assert_eq!(s.repeat, audio::Repeat::Off);
@@ -1040,10 +1189,14 @@ mod tests {
             repeat: audio::Repeat::One,
             queue_open: true,
             last_view: View::Artist("abc123".to_string()),
+            cache_max_mb: 512,
+            prefetch_count: 7,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.volume, 0.5);
+        assert_eq!(back.cache_max_mb, 512);
+        assert_eq!(back.prefetch_count, 7);
         assert!(back.sidebar_collapsed);
         assert!(back.shuffle);
         assert_eq!(back.repeat, audio::Repeat::One);
@@ -1219,6 +1372,10 @@ mod tests {
 
         let partial: Settings = serde_json::from_str(r#"{"volume": 0.25}"#).unwrap();
         assert_eq!(partial.volume, 0.25);
+        assert_eq!(partial.cache_max_mb, 2048);
+        assert_eq!(partial.prefetch_count, 3);
+        let clamped: Settings = serde_json::from_str(r#"{"prefetch_count":255}"#).unwrap();
+        assert_eq!(clamped.prefetch_count, 10);
         assert!(!partial.sidebar_collapsed);
         assert!(!partial.shuffle);
         assert_eq!(partial.repeat, audio::Repeat::Off);

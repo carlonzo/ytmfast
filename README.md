@@ -92,7 +92,7 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | Path | Contents |
 | --- | --- |
 | `~/.config/ytmfast/` | Cookies (only when signed in) |
-| `~/.cache/ytmfast/audio/` | Downloaded tracks |
+| `~/.cache/ytmfast/audio/` | Downloaded tracks; cache size limit in Settings |
 | `~/.local/share/ytmfast/` | App state |
 
 ## Releasing

@@ -60,6 +60,7 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     egui::vec2(320.0, 52.0),
                                     egui::Sense::click(),
                                 );
+                                super::hover_prefetch(ui, &row_resp, track, actions);
                                 let is_current = current_id == Some(track.id.as_str());
                                 if row_resp.hovered() || is_current {
                                     ui.painter().rect_filled(
@@ -363,6 +364,7 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                 });
             }
             TopResult::Song(track) => {
+                super::hover_prefetch(ui, &card_resp, track, actions);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(card_rect), |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);

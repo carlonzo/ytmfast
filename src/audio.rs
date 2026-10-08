@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use crate::backend::Track;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +100,31 @@ impl Queue {
         }
     }
 
+    /// Distinct upcoming tracks in playback order, stopping before a full loop.
+    pub fn peek_ahead(&self, n: usize) -> Vec<&Track> {
+        let mut ahead = Vec::new();
+        if n == 0 || self.repeat == Repeat::One || self.current().is_none() {
+            return ahead;
+        }
+        let current_id = self.current().map(|track| track.id.as_str());
+        let mut seen = HashSet::new();
+        let positions = (self.pos + 1..self.order.len()).chain(
+            (0..self.pos).take(if self.repeat == Repeat::All { self.pos } else { 0 }),
+        );
+        for pos in positions {
+            if let Some(track) = self.tracks.get(self.order[pos])
+                && Some(track.id.as_str()) != current_id
+                && seen.insert(track.id.as_str())
+            {
+                ahead.push(track);
+                if ahead.len() == n {
+                    break;
+                }
+            }
+        }
+        ahead
+    }
+
     pub fn prev(&mut self) -> Option<&Track> {
         if self.order.is_empty() {
             return None;
@@ -163,30 +189,89 @@ impl Queue {
     }
 }
 
-/// Track worth prefetching now: `peek_next` unless it is the current track
-/// (repeat One / single-track loop => nothing new) or was already requested.
-pub fn prefetch_target(queue: &Queue, already: Option<&str>) -> Option<Track> {
-    let next = queue.peek_next()?;
-    let current_id = queue.current().map(|t| t.id.as_str());
-    if Some(next.id.as_str()) == current_id {
-        return None;
-    }
-    if already == Some(next.id.as_str()) {
-        return None;
-    }
-    Some(next.clone())
+/// Upcoming tracks that have not already been requested.
+pub fn prefetch_targets(queue: &Queue, n: usize, already: &HashSet<String>) -> Vec<Track> {
+    queue.peek_ahead(n).into_iter()
+        .filter(|track| !already.contains(&track.id))
+        .cloned()
+        .collect()
 }
 
 pub fn is_valid_id(id: &str) -> bool {
     id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-pub fn cache_path(id: &str) -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     let dir = directories::BaseDirs::new()
         .map(|b| b.cache_dir().join("ytmfast/audio"))
         .unwrap_or_else(|| PathBuf::from("/tmp/ytmfast/audio"));
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{id}.m4a"))
+    dir
+}
+
+pub fn cache_path(id: &str) -> PathBuf {
+    cache_dir().join(format!("{id}.m4a"))
+}
+
+fn cache_files(dir: &Path) -> Vec<(String, u64, SystemTime)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let id = name.to_str()?.strip_suffix(".m4a")?;
+        if !is_valid_id(id) {
+            return None;
+        }
+        let metadata = entry.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some((id.to_owned(), metadata.len(), metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+    }).collect()
+}
+
+pub fn cache_usage(dir: &Path) -> (u64, usize) {
+    let files = cache_files(dir);
+    (files.iter().map(|(_, size, _)| size).sum(), files.len())
+}
+
+fn plan_eviction(
+    mut files: Vec<(String, u64, SystemTime)>,
+    max_bytes: u64,
+    protect: &HashSet<String>,
+) -> Vec<String> {
+    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    files.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let mut evict = Vec::new();
+    for (id, size, _) in files {
+        if max_bytes != 0 && total <= max_bytes {
+            break;
+        }
+        if !protect.contains(&id) {
+            total -= size;
+            evict.push(id);
+        }
+    }
+    evict
+}
+
+pub fn enforce_cache_limit(dir: &Path, max_bytes: u64, protect: &HashSet<String>) -> (u64, usize) {
+    let files = cache_files(dir);
+    let mut total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    let sizes: std::collections::HashMap<_, _> = files.iter()
+        .map(|(id, size, _)| (id.clone(), *size)).collect();
+    // Keep trying younger files if an older file cannot be removed.
+    for id in plan_eviction(files, 0, protect) {
+        if max_bytes != 0 && total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(dir.join(format!("{id}.m4a"))).is_ok()
+            && let Some(size) = sizes.get(&id)
+        {
+            total -= size;
+        }
+    }
+    cache_usage(dir)
 }
 
 pub fn ytdlp_args(id: &str, out: &Path, cookies: Option<&Path>) -> Vec<String> {
@@ -230,6 +315,10 @@ fn fetch_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .entry(id.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+pub fn is_fetching(id: &str) -> bool {
+    fetch_lock(id).try_lock().is_err()
 }
 
 pub async fn fetch(id: &str, cookies: Option<&Path>) -> Result<PathBuf, String> {
@@ -844,35 +933,101 @@ mod tests {
     }
 
     #[test]
-    fn test_prefetch_target() {
-        // Middle => Some(next)
-        let q = Queue::new(make_test_tracks(3), 0);
-        let t = prefetch_target(&q, None).unwrap();
-        assert_eq!(t.id, "test_id_0001");
-
-        // Already requested => None
-        let q = Queue::new(make_test_tracks(3), 0);
-        assert!(prefetch_target(&q, Some("test_id_0001")).is_none());
-
-        // Repeat One => next == current => None
-        let mut q = Queue::new(make_test_tracks(3), 1);
+    fn test_peek_ahead() {
+        let ids = |queue: &Queue, n| queue.peek_ahead(n).into_iter()
+            .map(|track| track.id.clone()).collect::<Vec<_>>();
+        let mut q = Queue::new(make_test_tracks(4), 0);
+        assert_eq!(ids(&q, 2), ["test_id_0001", "test_id_0002"]);
+        assert!(ids(&q, 0).is_empty());
+        q.pos = 3;
+        assert!(ids(&q, 10).is_empty());
+        q.repeat = Repeat::All;
+        assert_eq!(ids(&q, 10), ["test_id_0000", "test_id_0001", "test_id_0002"]);
+        q.pos = 1;
+        assert_eq!(ids(&q, 10), ["test_id_0002", "test_id_0003", "test_id_0000"]);
         q.repeat = Repeat::One;
-        assert!(prefetch_target(&q, None).is_none());
+        assert!(ids(&q, 10).is_empty());
+        q.repeat = Repeat::Off;
+        q.shuffle = true;
+        q.order = vec![1, 3, 0, 2];
+        q.pos = 0;
+        assert_eq!(ids(&q, 10), ["test_id_0003", "test_id_0000", "test_id_0002"]);
+        q.tracks[3].id = q.tracks[1].id.clone();
+        q.tracks[2].id = q.tracks[0].id.clone();
+        assert_eq!(ids(&q, 10), ["test_id_0000"]);
+        assert!(Queue::new(Vec::new(), 0).peek_ahead(3).is_empty());
+        let mut single = Queue::new(make_test_tracks(1), 0);
+        single.repeat = Repeat::All;
+        assert!(single.peek_ahead(3).is_empty());
+    }
 
-        // Single-track repeat All => wraps to itself => None
-        let mut q = Queue::new(make_test_tracks(1), 0);
-        q.repeat = Repeat::All;
-        assert!(prefetch_target(&q, None).is_none());
+    #[test]
+    fn test_prefetch_targets() {
+        let q = Queue::new(make_test_tracks(4), 0);
+        let already = HashSet::from(["test_id_0001".to_owned()]);
+        let targets = prefetch_targets(&q, 2, &already);
+        assert_eq!(targets.iter().map(|track| track.id.as_str()).collect::<Vec<_>>(), ["test_id_0002"]);
+        assert_eq!(prefetch_targets(&q, 10, &HashSet::new()).len(), 3);
+        assert!(prefetch_targets(&q, 0, &already).is_empty());
+    }
 
-        // Last with repeat Off => None
-        let q = Queue::new(make_test_tracks(3), 2);
-        assert!(prefetch_target(&q, None).is_none());
+    #[test]
+    fn test_plan_eviction() {
+        let time = SystemTime::UNIX_EPOCH;
+        let files = vec![
+            ("b".to_owned(), 10, time + Duration::from_secs(1)),
+            ("a".to_owned(), 10, time),
+            ("c".to_owned(), 10, time + Duration::from_secs(2)),
+        ];
+        let empty = HashSet::new();
+        assert!(plan_eviction(files.clone(), 30, &empty).is_empty());
+        assert_eq!(plan_eviction(files.clone(), 10, &empty), ["a", "b"]);
+        let protected = HashSet::from(["a".to_owned()]);
+        assert_eq!(plan_eviction(files.clone(), 20, &protected), ["b"]);
+        assert_eq!(plan_eviction(files, 0, &protected), ["b", "c"]);
+        let ties = vec![("b".to_owned(), 10, time), ("a".to_owned(), 10, time)];
+        assert_eq!(plan_eviction(ties, 10, &empty), ["a"]);
+        assert_eq!(plan_eviction(vec![("empty".to_owned(), 0, time)], 0, &empty), ["empty"]);
+    }
 
-        // Last with repeat All => wraps to first => Some
-        let mut q = Queue::new(make_test_tracks(3), 2);
-        q.repeat = Repeat::All;
-        let t = prefetch_target(&q, None).unwrap();
-        assert_eq!(t.id, "test_id_0000");
+    #[test]
+    fn test_enforce_cache_limit() {
+        let dir = std::env::temp_dir().join(format!("ytmfast_cache_test_{}_{}",
+            std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, age) in [("AAAAAAAAAAA", 0), ("BBBBBBBBBBB", 1), ("CCCCCCCCCCC", 2)] {
+            let path = dir.join(format!("{id}.m4a"));
+            std::fs::write(&path, b"1234567890").unwrap();
+            std::fs::File::options().write(true).open(path).unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(age)).unwrap();
+        }
+        let excluded = ["AAAAAAAAAAA.42-1.dl.m4a", "BBBBBBBBBBB.m4a.part", "invalid.m4a"];
+        for name in excluded {
+            std::fs::write(dir.join(name), b"temporary").unwrap();
+        }
+        std::fs::create_dir(dir.join("DDDDDDDDDDD.m4a")).unwrap();
+        assert_eq!(cache_usage(&dir), (30, 3));
+        let protected = HashSet::from(["AAAAAAAAAAA".to_owned()]);
+        assert_eq!(enforce_cache_limit(&dir, 20, &protected), (20, 2));
+        assert!(dir.join("AAAAAAAAAAA.m4a").exists());
+        assert!(!dir.join("BBBBBBBBBBB.m4a").exists());
+        assert!(dir.join("CCCCCCCCCCC.m4a").exists());
+        assert_eq!(enforce_cache_limit(&dir, 0, &protected), (10, 1));
+        for name in excluded {
+            assert!(dir.join(name).exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_is_fetching() {
+        let id = "fetch_probe";
+        let lock = fetch_lock(id);
+        assert!(!is_fetching(id));
+        let guard = lock.try_lock().unwrap();
+        assert!(is_fetching(id));
+        drop(guard);
+        assert!(!is_fetching(id));
     }
 
     #[test]
