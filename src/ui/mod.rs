@@ -1,4 +1,5 @@
 pub mod library;
+pub mod lyrics;
 pub mod pages;
 
 use std::time::Duration;
@@ -35,10 +36,12 @@ fastframe_icons::icons! {
         Repeat => "repeat",
         RepeatOne => "repeat-1",
         Queue => "list-music",
+        Lyrics => "mic-vocal",
         Volume => lucide "volume-2",
         VolumeMute => lucide "volume-x",
         Plus => lucide "plus",
         User => lucide "user",
+        Settings => "settings",
         Refresh => lucide "refresh-cw",
         Close => lucide "x",
         Alert => lucide "circle-alert",
@@ -169,6 +172,11 @@ pub enum Action {
         start: usize,
         shuffle: Option<bool>,
     },
+    Prefetch(Track),
+    ShowSettings,
+    SetPrefetchCount(u8),
+    SetCacheMaxMb(u32),
+    ClearCache,
     TogglePlayPause,
     NextTrack(bool),
     PrevTrack,
@@ -180,6 +188,8 @@ pub enum Action {
     SetRepeat(crate::audio::Repeat),
     Jump(usize),
     ToggleQueue,
+    ToggleLyrics,
+    RetryLyrics,
     Resume,
     Pause,
     SeekRelative(i64),
@@ -393,6 +403,11 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                         if ui.add(sign_in_btn).clicked() {
                             actions.push(Action::ShowSignIn);
                         }
+                    }
+                    if ui.add(egui::Button::image(Icon::Settings.image(COLOR_TEXT_SECONDARY, 20.0)))
+                        .on_hover_text("Settings").clicked()
+                    {
+                        actions.push(Action::ShowSettings);
                     }
                 });
             });
@@ -732,7 +747,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
 
-                    // Right-to-left order on screen: volume, repeat, shuffle, queue.
+                    // Right-to-left order on screen: volume, repeat, shuffle, lyrics, queue.
                     let queue_color = if app.queue_open {
                         COLOR_ACCENT_RED
                     } else {
@@ -748,6 +763,20 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                         .clicked()
                     {
                         actions.push(Action::ToggleQueue);
+                    }
+                    ui.add_space(8.0);
+
+                    let lyrics_color = if app.lyrics_open {
+                        COLOR_ACCENT_RED
+                    } else {
+                        COLOR_TEXT_SECONDARY
+                    };
+                    if ui
+                        .add(egui::Button::image(Icon::Lyrics.image(lyrics_color, 18.0)).frame(false))
+                        .on_hover_text("Lyrics")
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleLyrics);
                     }
                     ui.add_space(8.0);
 
@@ -972,6 +1001,7 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                                 COLOR_SURFACE,
                             );
                         }
+                        hover_prefetch(ui, &row_resp, track, actions);
                         draw_queue_row_body(ui, row_rect, track, is_current);
                         if row_resp.clicked() {
                             actions.push(Action::Jump(pos));
@@ -1165,6 +1195,70 @@ pub fn draw_shelf(
         });
 }
 
+pub fn hover_prefetch(ui: &mut egui::Ui, response: &egui::Response, track: &Track, actions: &mut Vec<Action>) {
+    let id = response.id.with(("hover_prefetch", &track.id));
+    let frame = ui.ctx().cumulative_frame_nr();
+    let now = std::time::Instant::now();
+    if !response.contains_pointer() {
+        ui.data_mut(|data| data.remove::<(std::time::Instant, u64, bool)>(id));
+        return;
+    }
+    let (start, last_frame, sent) = ui.data_mut(|data| {
+        data.get_temp::<(std::time::Instant, u64, bool)>(id).unwrap_or((now, frame, false))
+    });
+    let (start, sent) = if frame.saturating_sub(last_frame) > 1 { (now, false) } else { (start, sent) };
+    let elapsed = now.duration_since(start);
+    let delay = Duration::from_millis(300);
+    let ready = elapsed >= delay;
+    if ready && !sent {
+        actions.push(Action::Prefetch(track.clone()));
+    } else if !ready {
+        ui.ctx().request_repaint_after(delay - elapsed);
+    }
+    ui.data_mut(|data| data.insert_temp(id, (start, frame, sent || ready)));
+}
+
+pub fn draw_settings_dialog(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
+    if !app.show_settings { return; }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.show_settings = false;
+        return;
+    }
+    egui::Window::new("Settings")
+        .open(&mut app.show_settings)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .frame(egui::Frame::window(ui.style()).fill(COLOR_SURFACE))
+        .show(ui.ctx(), |ui| {
+            ui.heading("Playback");
+            let mut count = app.prefetch_count;
+            if ui.add(egui::Slider::new(&mut count, 0..=10).text("Prefetch next tracks")).changed() {
+                actions.push(Action::SetPrefetchCount(count));
+            }
+            ui.add_space(12.0);
+            ui.heading("Cache");
+            ui.horizontal(|ui| {
+                ui.label("Cache size limit");
+                let mut mb = app.cache_max_mb;
+                let r = ui.add(egui::DragValue::new(&mut mb).range(0..=100000).suffix(" MB").speed(16).update_while_editing(false));
+                app.cache_max_mb = mb;
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    actions.push(Action::SetCacheMaxMb(mb));
+                }
+            });
+            ui.label(egui::RichText::new("0 keeps only the playing and upcoming tracks").small().color(COLOR_TEXT_SECONDARY));
+            if let Some((bytes, files)) = app.cache_usage {
+                ui.label(format!("Using {:.1} MB in {files} tracks", bytes as f64 / (1024.0 * 1024.0)));
+            } else {
+                ui.label("Using …");
+            }
+            if ui.button("Clear cache").clicked() {
+                actions.push(Action::ClearCache);
+            }
+        });
+}
+
 pub fn draw_track_row(
     ui: &mut egui::Ui,
     idx: usize,
@@ -1178,6 +1272,7 @@ pub fn draw_track_row(
     let row_width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_width, row_height), egui::Sense::click());
 
+    hover_prefetch(ui, &resp, track, actions);
     let is_current = current_id == Some(track.id.as_str());
 
     if resp.hovered() || is_current {

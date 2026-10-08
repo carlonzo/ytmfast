@@ -6044,6 +6044,7 @@ dependencies = [
  "fastframe-icons",
  "fastframe-now-playing",
  "image",
+ "reqwest",
  "rodio",
  "rustypipe",
  "serde",

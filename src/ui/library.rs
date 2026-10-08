@@ -163,6 +163,7 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
                             egui::vec2(160.0, 210.0),
                             egui::Sense::click(),
                         );
+                        super::hover_prefetch(ui, &resp, track, actions);
                         if resp.hovered() {
                             ui.painter().rect_filled(
                                 rect.expand(4.0),

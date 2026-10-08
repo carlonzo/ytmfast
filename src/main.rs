@@ -1,6 +1,7 @@
 mod audio;
 mod auth;
 mod backend;
+mod lyrics;
 mod ui;
 
 use audio::{Player, Queue};
@@ -9,9 +10,11 @@ use backend::{
     Track,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use ui::{Action, Nav, View};
+use lyrics::{Lyrics, LyricsState};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -21,7 +24,11 @@ pub struct Settings {
     pub shuffle: bool,
     pub repeat: audio::Repeat,
     pub queue_open: bool,
+    pub lyrics_open: bool,
     pub last_view: View,
+    pub cache_max_mb: u32,
+    #[serde(deserialize_with = "deserialize_prefetch_count")]
+    pub prefetch_count: u8,
 }
 
 impl Default for Settings {
@@ -32,9 +39,16 @@ impl Default for Settings {
             shuffle: false,
             repeat: audio::Repeat::Off,
             queue_open: false,
+            lyrics_open: false,
             last_view: View::Home,
+            cache_max_mb: 2048,
+            prefetch_count: 3,
         }
     }
+}
+
+fn deserialize_prefetch_count<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    u8::deserialize(deserializer).map(|n| n.min(10))
 }
 
 impl Settings {
@@ -53,7 +67,10 @@ impl Settings {
             shuffle: app.queue.shuffle,
             repeat: app.queue.repeat,
             queue_open: app.queue_open,
+            lyrics_open: app.lyrics_open,
             last_view: Self::sanitize_view(app.nav.current.clone()),
+            cache_max_mb: app.cache_max_mb,
+            prefetch_count: app.prefetch_count,
         }
     }
 
@@ -63,6 +80,11 @@ impl Settings {
         app.queue.shuffle = self.shuffle;
         app.queue.repeat = self.repeat;
         app.queue_open = self.queue_open;
+        app.lyrics_open = self.lyrics_open && !self.queue_open;
+        app.cache_max_mb = self.cache_max_mb;
+        app.sent_cache_max_mb = self.cache_max_mb;
+        app.prefetch_count = self.prefetch_count.min(10);
+        app.update_cache_policy();
         // Signed-in state comes from disk + rustypipe, not Settings: a
         // restored private view while signed out would show a broken page.
         // Album/Artist pages are public, so only Library and Playlist fall
@@ -174,6 +196,18 @@ fn is_double_click_repeat(
     }
 }
 
+fn cache_protection(queue: &Queue, prefetched: &HashSet<String>, n: usize, loading: bool) -> HashSet<String> {
+    let mut protect = prefetched.clone();
+    if let Some(track) = queue.current() {
+        protect.insert(track.id.clone());
+    }
+    // Keep upcoming cached files through loading so a zero cap does not evict them on advance.
+    if loading {
+        protect.extend(queue.peek_ahead(n).into_iter().map(|track| track.id.clone()));
+    }
+    protect
+}
+
 /// MPRIS/media-keys command mapped onto an existing Action or direct state
 /// change. Pure so it is unit-testable.
 fn map_mpris_command(cmd: fastframe_now_playing::Command, current_id: Option<&str>) -> Option<Action> {
@@ -217,7 +251,18 @@ pub struct App {
     pub fetch_error: Option<String>,
     pub is_active_playback: bool,
     pub queue_open: bool,
-    pub prefetched: Option<String>,
+    pub lyrics_open: bool,
+    pub lyrics: Option<(String, LyricsState)>,
+    lyrics_cache: HashMap<String, Option<Lyrics>>,
+    pub prefetched: HashSet<String>,
+    // ponytail: bounded by IDs hovered in this session; evict the set if sessions grow huge.
+    hover_prefetched: HashSet<String>,
+    pub cache_max_mb: u32,
+    sent_cache_max_mb: u32,
+    sent_cache_policy: Option<(u64, HashSet<String>)>,
+    pub prefetch_count: u8,
+    pub show_settings: bool,
+    pub cache_usage: Option<(u64, usize)>,
     pub radio_pending: Option<String>,
     /// Transient radio failure notice with its timestamp: shown in the
     /// player bar but auto-expires after `RADIO_ERROR_TTL` so it never
@@ -270,6 +315,27 @@ pub enum LibraryChip {
 }
 
 impl App {
+    fn request_lyrics(&mut self) {
+        if let Some(track) = self.queue.current().cloned() {
+            self.lyrics = Some((track.id.clone(), LyricsState::Loading));
+            self.backend.send(Cmd::Lyrics(track));
+        }
+    }
+
+    fn maybe_lyrics(&mut self) {
+        if !self.lyrics_open { return; }
+        let Some(track) = self.queue.current() else {
+            self.lyrics = None;
+            return;
+        };
+        if self.lyrics.as_ref().is_some_and(|(id, _)| *id == track.id) { return; }
+        if let Some(found) = self.lyrics_cache.get(&track.id) {
+            self.lyrics = Some((track.id.clone(), LyricsState::Ready(found.clone())));
+        } else {
+            self.request_lyrics();
+        }
+    }
+
     pub fn new(ctx: egui::Context) -> Self {
         let backend = Backend::new(ctx);
         let player = Player::new();
@@ -287,7 +353,17 @@ impl App {
             fetch_error,
             is_active_playback: false,
             queue_open: false,
-            prefetched: None,
+            lyrics_open: false,
+            lyrics: None,
+            lyrics_cache: HashMap::new(),
+            prefetched: HashSet::new(),
+            hover_prefetched: HashSet::new(),
+            cache_max_mb: 2048,
+            sent_cache_max_mb: 2048,
+            sent_cache_policy: None,
+            prefetch_count: 3,
+            show_settings: false,
+            cache_usage: None,
             radio_pending: None,
             radio_error: None,
             last_start: None,
@@ -324,7 +400,8 @@ impl App {
         self.is_active_playback = true;
         self.is_loading = true;
         self.fetch_error = None;
-        self.prefetched = None;
+        self.prefetched.clear();
+        self.update_cache_policy();
         self.radio_error = None;
         self.last_start = Some(LastStart {
             track_id: track.id.clone(),
@@ -347,14 +424,35 @@ impl App {
         })
     }
 
-    /// Send Prefetch for the likely-next track, at most once per id.
-    fn maybe_prefetch(&mut self) {
-        if !self.is_active_playback || self.is_loading {
+    pub fn cache_protect(&self) -> HashSet<String> {
+        cache_protection(&self.queue, &self.prefetched, self.prefetch_count as usize, self.is_loading)
+    }
+
+    fn update_cache_policy(&mut self) {
+        let max_bytes = u64::from(self.sent_cache_max_mb) * 1024 * 1024;
+        let protect = self.cache_protect();
+        if self.sent_cache_policy.as_ref().is_some_and(|(sent_max, sent_protect)| {
+            *sent_max == max_bytes && *sent_protect == protect
+        }) {
             return;
         }
-        if let Some(next) = audio::prefetch_target(&self.queue, self.prefetched.as_deref()) {
-            self.prefetched = Some(next.id.clone());
-            self.backend.send(Cmd::Prefetch(next));
+        self.backend.send(Cmd::SetCachePolicy {
+            max_bytes,
+            protect: protect.clone(),
+        });
+        self.sent_cache_policy = Some((max_bytes, protect));
+    }
+
+    fn maybe_prefetch(&mut self) {
+        if !self.is_active_playback || self.is_loading {
+            self.update_cache_policy();
+            return;
+        }
+        let targets = audio::prefetch_targets(&self.queue, self.prefetch_count as usize, &self.prefetched);
+        self.prefetched.extend(targets.iter().map(|t| t.id.clone()));
+        self.update_cache_policy();
+        for track in targets {
+            self.backend.send(Cmd::Prefetch(track));
         }
     }
 
@@ -365,6 +463,7 @@ impl App {
             self.is_active_playback = false;
             self.is_loading = false;
             self.player.stop();
+            self.update_cache_policy();
         }
     }
 
@@ -423,6 +522,43 @@ impl App {
 
     fn apply_action(&mut self, action: Action) {
         match action {
+            Action::Prefetch(track) => {
+                if !self.prefetched.contains(&track.id) && self.hover_prefetched.insert(track.id.clone()) {
+                    self.backend.send(Cmd::Prefetch(track));
+                }
+            }
+            Action::ShowSettings => {
+                self.show_settings = true;
+                self.cache_usage = None;
+                self.backend.send(Cmd::CacheUsage);
+            }
+            Action::SetPrefetchCount(count) => {
+                if self.prefetch_count != count {
+                    self.prefetch_count = count.min(10);
+                    let ahead: HashSet<_> = self.queue.peek_ahead(self.prefetch_count as usize)
+                        .into_iter().map(|track| track.id.clone()).collect();
+                    self.prefetched.retain(|id| ahead.contains(id));
+                    self.maybe_prefetch();
+                }
+            }
+            Action::SetCacheMaxMb(mb) => {
+                self.cache_max_mb = mb;
+                if self.sent_cache_max_mb != mb {
+                    self.sent_cache_max_mb = mb;
+                    let max_bytes = u64::from(mb) * 1024 * 1024;
+                    let protect = self.cache_protect();
+                    self.backend.send(Cmd::EnforceCache {
+                        max_bytes,
+                        protect: protect.clone(),
+                    });
+                    self.sent_cache_policy = Some((max_bytes, protect));
+                }
+            }
+            Action::ClearCache => {
+                self.cache_usage = None;
+                self.hover_prefetched.clear();
+                self.backend.send(Cmd::ClearCache { protect: self.cache_protect() });
+            }
             Action::PlayList {
                 tracks,
                 start,
@@ -454,11 +590,14 @@ impl App {
                     Some(s) => s,
                     None => self.queue.shuffle,
                 };
+                self.prefetched.clear();
                 self.queue = Queue::new(tracks, start);
                 self.queue.repeat = prev_repeat;
                 self.queue.set_shuffle(prev_shuffle);
                 if let Some(track) = self.queue.current().cloned() {
                     self.start_track(track);
+                } else {
+                    self.update_cache_policy();
                 }
             }
             Action::TogglePlayPause => {
@@ -471,15 +610,18 @@ impl App {
                     self.is_active_playback = false;
                     self.is_loading = false;
                     self.player.stop();
+                    self.update_cache_policy();
                 }
             }
             Action::ToggleShuffle => {
                 let new_shuf = !self.queue.shuffle;
                 self.queue.set_shuffle(new_shuf);
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::CycleRepeat => {
                 self.queue.cycle_repeat();
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::Jump(pos) => {
@@ -491,15 +633,26 @@ impl App {
                     self.start_track(track);
                 }
             }
+            Action::ToggleLyrics => {
+                self.lyrics_open = !self.lyrics_open;
+                if self.lyrics_open { self.queue_open = false; }
+                self.maybe_lyrics();
+            }
+            Action::RetryLyrics => self.request_lyrics(),
             Action::ToggleQueue => {
                 self.queue_open = !self.queue_open;
+                if self.queue_open { self.lyrics_open = false; }
             }
             Action::SetShuffle(s) => {
+                if self.queue.shuffle == s { return; }
                 self.queue.set_shuffle(s);
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::SetRepeat(r) => {
+                if self.queue.repeat == r { return; }
                 self.queue.repeat = r;
+                self.prefetched.clear();
                 self.maybe_prefetch();
             }
             Action::Resume => {
@@ -655,6 +808,22 @@ impl eframe::App for App {
         // Poll backend events
         while let Some(event) = self.backend.try_recv() {
             match event {
+                Event::Lyrics { id, result } => {
+                    if self.queue.current().is_some_and(|track| track.id == id) {
+                        let state = match result {
+                            Ok(found) => {
+                                // ponytail: at most 64 session results; disk cache retains evicted lyrics.
+                                if self.lyrics_cache.len() >= 64 && !self.lyrics_cache.contains_key(&id) {
+                                    self.lyrics_cache.clear();
+                                }
+                                self.lyrics_cache.insert(id.clone(), found.clone());
+                                LyricsState::Ready(found)
+                            }
+                            Err(error) => LyricsState::Error(error),
+                        };
+                        self.lyrics = Some((id, state));
+                    }
+                }
                 Event::Home(home) => {
                     self.home_loading = false;
                     self.home_error = None;
@@ -700,6 +869,7 @@ impl eframe::App for App {
                     } else {
                         let prev_repeat = self.queue.repeat;
                         let prev_shuffle = self.queue.shuffle;
+                        self.prefetched.clear();
                         self.queue = Queue::new(tracks, 0);
                         self.queue.repeat = prev_repeat;
                         self.queue.set_shuffle(prev_shuffle);
@@ -730,11 +900,16 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Event::CacheUsage { bytes, files } => {
+                    self.cache_usage = Some((bytes, files));
+                }
                 Event::Ready { id, path } => {
                     if self.is_loading
                         && self.queue.current().map(|t| t.id.as_str()) == Some(&id)
                     {
                         self.is_loading = false;
+                        let _ = std::fs::File::options().write(true).open(&path)
+                            .and_then(|file| file.set_modified(std::time::SystemTime::now()));
                         if let Err(e) = self.player.play_file(&path) {
                             self.fetch_error = Some(e);
                         } else {
@@ -749,6 +924,7 @@ impl eframe::App for App {
                     {
                         self.is_loading = false;
                         self.fetch_error = Some(msg);
+                        self.maybe_prefetch();
                     }
                 }
                 Event::Auth { signed_in, error } => {
@@ -832,6 +1008,7 @@ impl eframe::App for App {
         {
             self.auto_advance();
         }
+        self.maybe_lyrics();
         let mut actions = Vec::new();
 
         // MPRIS / media keys: map desktop commands onto Actions.
@@ -863,9 +1040,12 @@ impl eframe::App for App {
         ui::draw_player_bar(ui, self, &mut actions);
         if self.queue_open {
             ui::draw_queue_panel(ui, self, &mut actions);
+        } else if self.lyrics_open {
+            ui::lyrics::draw_lyrics_panel(ui, self, &mut actions);
         }
         ui::draw_central_panel(ui, self, &mut actions);
         ui::draw_sign_in_dialog(ui, self, &mut actions);
+        ui::draw_settings_dialog(ui, self, &mut actions);
 
         // Apply actions (Raise/Quit need the viewport, so handle inline)
         let mut viewport_cmds = Vec::new();
@@ -931,12 +1111,45 @@ impl App {
         });
     }
 }
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_extra_paths(path: &OsStr, extra: &[&str]) -> OsString {
+    let mut paths: Vec<_> = if path.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(path).collect()
+    };
+    for entry in extra {
+        let entry = std::path::PathBuf::from(entry);
+        if !paths.contains(&entry) {
+            paths.push(entry);
+        }
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| path.to_os_string())
+}
+
+#[cfg(target_os = "macos")]
+fn add_homebrew_paths() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = with_extra_paths(&path, &["/opt/homebrew/bin", "/usr/local/bin"]);
+    // SAFETY: called first in main, before any other thread exists.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "macos")]
+    add_homebrew_paths();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("ytmfast")
+        .with_app_id("ytmfast")
+        .with_inner_size([1200.0, 800.0])
+        .with_min_inner_size([800.0, 600.0]);
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(error) => eprintln!("Could not load app icon: {error}"),
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ytmfast")
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -968,13 +1181,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extra_paths_preserve_order_and_add_only_missing_entries() {
+        let path = OsStr::new("/usr/bin:/opt/homebrew/bin:/bin");
+        let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/bin"];
+        let extended = with_extra_paths(path, &extra);
+        assert_eq!(extended, "/usr/bin:/opt/homebrew/bin:/bin:/usr/local/bin");
+        assert_eq!(with_extra_paths(&extended, &extra), extended);
+        assert_eq!(with_extra_paths(path, &[]), path);
+    }
+
+    #[test]
+    fn extra_paths_handle_empty_path() {
+        assert_eq!(
+            with_extra_paths(OsStr::new(""), &["/opt/homebrew/bin", "/usr/local/bin"]),
+            "/opt/homebrew/bin:/usr/local/bin"
+        );
+        assert_eq!(with_extra_paths(OsStr::new(""), &[]), "");
+    }
+
+    #[test]
+    fn test_cache_protection_survives_loading_transition() {
+        let tracks = (0..5).map(|i| Track {
+            id: format!("test_id_{i:04}"),
+            title: String::new(), artist: String::new(), album: String::new(),
+            duration_secs: 0, thumb_url: None, artist_id: None, album_id: None,
+        }).collect();
+        let mut queue = Queue::new(tracks, 1);
+        let empty = HashSet::new();
+        // Advance cleared requests: retain the current and next two files until Ready.
+        assert_eq!(cache_protection(&queue, &empty, 2, true),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0002".to_owned(), "test_id_0003".to_owned()]));
+        let current = HashSet::from(["test_id_0001".to_owned()]);
+        assert_eq!(cache_protection(&queue, &empty, 0, true), current);
+        assert_eq!(cache_protection(&queue, &empty, 2, false), current);
+        let prefetched = HashSet::from(["test_id_0002".to_owned()]);
+        assert_eq!(cache_protection(&queue, &prefetched, 2, false),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0002".to_owned()]));
+        queue.order = vec![1, 4, 0, 3, 2];
+        queue.pos = 0;
+        assert_eq!(cache_protection(&queue, &empty, 2, true),
+            HashSet::from(["test_id_0001".to_owned(), "test_id_0004".to_owned(), "test_id_0000".to_owned()]));
+        queue.repeat = audio::Repeat::One;
+        assert_eq!(cache_protection(&queue, &empty, 2, true), current);
+        assert!(cache_protection(&Queue::new(Vec::new(), 0), &empty, 2, true).is_empty());
+    }
+
+    #[test]
     fn test_settings_default_volume() {
         let s = Settings::default();
         assert_eq!(s.volume, 1.0);
+        assert_eq!(s.cache_max_mb, 2048);
+        assert_eq!(s.prefetch_count, 3);
         assert!(!s.sidebar_collapsed);
         assert!(!s.shuffle);
         assert_eq!(s.repeat, audio::Repeat::Off);
         assert!(!s.queue_open);
+        assert!(!s.lyrics_open);
         assert_eq!(s.last_view, View::Home);
     }
 
@@ -986,15 +1248,21 @@ mod tests {
             shuffle: true,
             repeat: audio::Repeat::One,
             queue_open: true,
+            lyrics_open: true,
             last_view: View::Artist("abc123".to_string()),
+            cache_max_mb: 512,
+            prefetch_count: 7,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.volume, 0.5);
+        assert_eq!(back.cache_max_mb, 512);
+        assert_eq!(back.prefetch_count, 7);
         assert!(back.sidebar_collapsed);
         assert!(back.shuffle);
         assert_eq!(back.repeat, audio::Repeat::One);
         assert!(back.queue_open);
+        assert!(back.lyrics_open);
         assert_eq!(back.last_view, View::Artist("abc123".to_string()));
 
         // Every View variant round-trips
@@ -1166,10 +1434,15 @@ mod tests {
 
         let partial: Settings = serde_json::from_str(r#"{"volume": 0.25}"#).unwrap();
         assert_eq!(partial.volume, 0.25);
+        assert_eq!(partial.cache_max_mb, 2048);
+        assert_eq!(partial.prefetch_count, 3);
+        let clamped: Settings = serde_json::from_str(r#"{"prefetch_count":255}"#).unwrap();
+        assert_eq!(clamped.prefetch_count, 10);
         assert!(!partial.sidebar_collapsed);
         assert!(!partial.shuffle);
         assert_eq!(partial.repeat, audio::Repeat::Off);
         assert!(!partial.queue_open);
+        assert!(!partial.lyrics_open);
         assert_eq!(partial.last_view, View::Home);
     }
 

@@ -28,12 +28,21 @@ jobs:
       - run: rustup update stable && rustup default stable
       - run: cargo test --release --locked
       - run: cargo build --release --locked
-      - name: Package
+      - name: Package Linux
+        if: runner.os == 'Linux'
         run: tar -czf ytmfast-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C target/release ytmfast
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          bash packaging/macos/bundle.sh target/release/ytmfast dist/ytmfast.app "${GITHUB_REF_NAME#v}"
+          label="${GITHUB_REF_NAME//\//-}"
+          ditto -c -k --keepParent dist/ytmfast.app "ytmfast-${label}-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
-          path: ytmfast-*.tar.gz
+          path: |
+            ytmfast-*.tar.gz
+            ytmfast-*.zip
 
   release:
     needs: build
@@ -46,4 +55,4 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" ytmfast-*.tar.gz --repo "${{ github.repository }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" ytmfast-*.tar.gz ytmfast-*.zip --repo "${{ github.repository }}" --generate-notes

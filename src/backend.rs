@@ -1,7 +1,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +101,12 @@ pub enum Cmd {
     OpenArtist(String, u64),
     Radio(String),
     Fetch(Track),
+    Lyrics(Track),
     Prefetch(Track),
+    SetCachePolicy { max_bytes: u64, protect: HashSet<String> },
+    EnforceCache { max_bytes: u64, protect: HashSet<String> },
+    CacheUsage,
+    ClearCache { protect: HashSet<String> },
     SignIn(SignInSource),
     SignOut,
     LoadLibrary(u64),
@@ -108,6 +114,7 @@ pub enum Cmd {
 
 pub enum Event {
     Home(Home),
+    Lyrics { id: String, result: Result<Option<crate::lyrics::Lyrics>, String> },
     HomeError(String),
     SearchResults(SearchAll),
     SearchError { query: String, error: String },
@@ -122,6 +129,7 @@ pub enum Event {
         generation: u64,
     },
     Ready { id: String, path: PathBuf },
+    CacheUsage { bytes: u64, files: usize },
     FetchError { id: String, msg: String },
     Auth { signed_in: bool, error: Option<String> },
     Library { generation: u64, library: Library },
@@ -342,6 +350,42 @@ pub fn split_artist_albums(
     (albums, singles)
 }
 
+// The backend enforces after every successful fetch/prefetch using the shared
+// max_bytes + protect set updated by the App via Cmd::SetCachePolicy.
+// The in_flight counter also protects downloads; one lock makes updates atomic.
+#[derive(Default)]
+struct CachePolicy {
+    max_bytes: u64,
+    protect: HashSet<String>,
+    in_flight: HashMap<String, usize>,
+}
+
+async fn enforce_policy(policy: Arc<Mutex<CachePolicy>>, clear: Option<HashSet<String>>) -> (u64, usize) {
+    tokio::task::spawn_blocking(move || {
+        // ponytail: hold the std Mutex across scan/deletes for atomic policy updates; briefly stalls dispatcher/finish_download, fine at current cache sizes; snapshot and re-check per file if it matters.
+        let policy = policy.lock().unwrap_or_else(|e| e.into_inner());
+        let mut protect = policy.protect.clone();
+        protect.extend(policy.in_flight.keys().cloned());
+        let max_bytes = if let Some(extra) = clear {
+            protect.extend(extra);
+            0
+        } else {
+            policy.max_bytes
+        };
+        crate::audio::enforce_cache_limit(&crate::audio::cache_dir(), max_bytes, &protect)
+    }).await.unwrap_or_default()
+}
+
+fn finish_download(policy: &Mutex<CachePolicy>, id: &str) {
+    let mut policy = policy.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(count) = policy.in_flight.get_mut(id) {
+        *count -= 1;
+        if *count == 0 {
+            policy.in_flight.remove(id);
+        }
+    }
+}
+
 pub struct Backend {
     tx: mpsc::Sender<Cmd>,
     rx: mpsc::Receiver<Event>,
@@ -467,6 +511,54 @@ async fn fail_auth(
     ctx.request_repaint();
 }
 
+fn is_not_found(e: &rustypipe::error::Error) -> bool {
+    matches!(
+        e,
+        rustypipe::error::Error::Extraction(rustypipe::error::ExtractionError::NotFound { .. })
+    )
+}
+
+async fn fetch_lyrics(
+    http: &Result<reqwest::Client, String>,
+    rp: Option<&Arc<rustypipe::client::RustyPipe>>,
+    track: &Track,
+) -> Result<Option<crate::lyrics::Lyrics>, String> {
+    let cache_dir = directories::BaseDirs::new()
+        .map(|b| b.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = crate::lyrics::cache_path(&cache_dir, &track.id)?;
+    if let Some(found) = crate::lyrics::cached(&path).await {
+        return Ok(found);
+    }
+    let http = http.as_ref().map_err(Clone::clone)?;
+    let query = crate::lyrics::Query {
+        artist: track.artist.clone(),
+        title: track.title.clone(),
+        album: track.album.clone(),
+        duration_ms: track.duration_secs.saturating_mul(1000),
+    };
+    let mut found = crate::lyrics::lookup(http, &query).await?;
+    if found.is_none() {
+        let Some(rp) = rp else {
+            return Ok(None);
+        };
+        let lyrics_id = match authed_query(rp).music_details(&track.id).await {
+            Ok(details) => details.lyrics_id,
+            Err(e) if is_not_found(&e) => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        if let Some(id) = lyrics_id {
+            match authed_query(rp).music_lyrics(&id).await {
+                Ok(lyrics) => found = crate::lyrics::from_youtube(&lyrics.body),
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    crate::lyrics::store(&path, &found).await;
+    Ok(found)
+}
+
 impl Backend {
     pub fn new(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -549,9 +641,34 @@ impl Backend {
                 let _ = rt.block_on(rp.user_auth_remove_cookie());
             }
             let _guard = rt.as_ref().map(|r| r.enter());
+            let lyrics_http = reqwest::Client::builder().timeout(Duration::from_secs(10))
+                .build().map_err(|e| format!("Lyrics HTTP client init error: {e}"));
+            let prefetch_slots = Arc::new(tokio::sync::Semaphore::new(2));
+            let cache_policy = Arc::new(Mutex::new(CachePolicy {
+                max_bytes: 2048 * 1024 * 1024,
+                ..Default::default()
+            }));
             while let Ok(cmd) = cmd_rx.recv() {
+                // Update before spawning: a clicked track is protected before any eviction.
+                {
+                    let mut policy = cache_policy.lock().unwrap_or_else(|e| e.into_inner());
+                    match &cmd {
+                        Cmd::SetCachePolicy { max_bytes, protect }
+                        | Cmd::EnforceCache { max_bytes, protect } => {
+                            policy.max_bytes = *max_bytes;
+                            policy.protect = protect.clone();
+                        }
+                        Cmd::Fetch(track) | Cmd::Prefetch(track) => {
+                            *policy.in_flight.entry(track.id.clone()).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let cache_policy = cache_policy.clone();
+                let prefetch_slots = prefetch_slots.clone();
                 let event_tx = event_tx.clone();
                 let ctx = ctx.clone();
+                let lyrics_http = lyrics_http.clone();
                 let rp = rp.clone();
                 let rp_err = rp_err.clone();
                 let rt_err = rt_err.clone();
@@ -561,6 +678,11 @@ impl Backend {
                 if let Some(rt_ref) = &rt {
                     rt_ref.spawn(async move {
                         match cmd {
+                            Cmd::Lyrics(track) => {
+                                let result = fetch_lyrics(&lyrics_http, rp.as_ref(), &track).await;
+                                let _ = event_tx.send(Event::Lyrics { id: track.id, result });
+                                ctx.request_repaint();
+                            }
                             Cmd::LoadHome => {
                                 if let Some(rp) = rp {
                                     let q1 = rp.query();
@@ -1160,37 +1282,79 @@ impl Backend {
                                     )
                                     .await
                                 };
-                                match crate::audio::fetch(&track.id, temp.as_deref()).await {
+                                let result = crate::audio::fetch(&track.id, temp.as_deref()).await;
+                                let success = result.is_ok();
+                                match result {
                                     Ok(path) => {
                                         let _ = event_tx.send(Event::Ready {
-                                            id: track.id,
+                                            id: track.id.clone(),
                                             path,
                                         });
                                     }
                                     Err(msg) => {
                                         let _ = event_tx.send(Event::FetchError {
-                                            id: track.id,
+                                            id: track.id.clone(),
                                             msg,
                                         });
                                     }
                                 }
                                 cleanup_download_cookies(temp).await;
+                                finish_download(&cache_policy, &track.id);
+                                if success {
+                                    let (bytes, files) = enforce_policy(cache_policy, None).await;
+                                    let _ = event_tx.send(Event::CacheUsage { bytes, files });
+                                }
                                 ctx.request_repaint();
                             }
                             Cmd::Prefetch(track) => {
-                                // Warm the cache for the likely-next track. No
-                                // event on success; failures stay silent.
-                                let temp = if crate::audio::cache_path(&track.id).exists() {
-                                    None
-                                } else {
-                                    prepare_download_cookies(
-                                        cookie_path_now(&cookies).as_deref(),
-                                    )
-                                    .await
+                                if crate::audio::is_fetching(&track.id)
+                                    || tokio::fs::try_exists(crate::audio::cache_path(&track.id))
+                                        .await.unwrap_or(false)
+                                {
+                                    finish_download(&cache_policy, &track.id);
+                                    return;
+                                }
+                                let permit = match prefetch_slots.acquire().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        finish_download(&cache_policy, &track.id);
+                                        return;
+                                    }
                                 };
-                                let _ =
-                                    crate::audio::fetch(&track.id, temp.as_deref()).await;
+                                if crate::audio::is_fetching(&track.id)
+                                    || tokio::fs::try_exists(crate::audio::cache_path(&track.id))
+                                        .await.unwrap_or(false)
+                                {
+                                    drop(permit);
+                                    finish_download(&cache_policy, &track.id);
+                                    return;
+                                }
+                                let temp = prepare_download_cookies(cookie_path_now(&cookies).as_deref()).await;
+                                let success = crate::audio::fetch(&track.id, temp.as_deref()).await.is_ok();
                                 cleanup_download_cookies(temp).await;
+                                drop(permit);
+                                finish_download(&cache_policy, &track.id);
+                                if success {
+                                    let (bytes, files) = enforce_policy(cache_policy, None).await;
+                                    let _ = event_tx.send(Event::CacheUsage { bytes, files });
+                                }
+                                ctx.request_repaint();
+                            }
+                            Cmd::SetCachePolicy { .. } | Cmd::EnforceCache { .. } => {
+                                let (bytes, files) = enforce_policy(cache_policy, None).await;
+                                let _ = event_tx.send(Event::CacheUsage { bytes, files });
+                                ctx.request_repaint();
+                            }
+                            Cmd::CacheUsage => {
+                                let (bytes, files) = tokio::task::spawn_blocking(|| {
+                                    crate::audio::cache_usage(&crate::audio::cache_dir())
+                                }).await.unwrap_or_default();
+                                let _ = event_tx.send(Event::CacheUsage { bytes, files });
+                                ctx.request_repaint();
+                            }
+                            Cmd::ClearCache { protect } => {
+                                let (bytes, files) = enforce_policy(cache_policy, Some(protect)).await;
+                                let _ = event_tx.send(Event::CacheUsage { bytes, files });
                                 ctx.request_repaint();
                             }
                         }
@@ -1213,10 +1377,14 @@ impl Backend {
                         Cmd::Radio(id) => {
                             let _ = event_tx.send(Event::RadioError { id, error: err });
                         }
+                        Cmd::Lyrics(track) => {
+                            let _ = event_tx.send(Event::Lyrics { id: track.id, result: Err(err) });
+                        }
                         Cmd::Fetch(track) => {
                             let _ = event_tx.send(Event::FetchError { id: track.id, msg: err });
                         }
-                        Cmd::Prefetch(_) => {}
+                        Cmd::Prefetch(_) | Cmd::SetCachePolicy { .. } | Cmd::EnforceCache { .. }
+                        | Cmd::CacheUsage | Cmd::ClearCache { .. } => {}
                         Cmd::SignIn(_) => {
                             let _ = event_tx.send(Event::Auth {
                                 signed_in: false,
@@ -1260,6 +1428,36 @@ impl Backend {
 mod tests {
     use super::*;
     use rustypipe::model::Thumbnail;
+
+    #[test]
+    fn only_extraction_not_found_is_a_lyrics_miss() {
+        use rustypipe::error::{Error, ExtractionError};
+
+        for id in ["dQw4w9WgXcQ", "MPLYt_missing"] {
+            assert!(is_not_found(&Error::Extraction(ExtractionError::NotFound {
+                id: id.into(),
+                msg: "Lyrics not available".into(),
+            })));
+        }
+        assert!(!is_not_found(&Error::Extraction(ExtractionError::InvalidData(
+            "bad response".into(),
+        ))));
+        assert!(!is_not_found(&Error::Http("connection failed".into())));
+        assert!(!is_not_found(&Error::HttpStatus(404, "not found".into())));
+    }
+
+    #[test]
+    fn test_in_flight_fetch_join_stays_protected_until_both_finish() {
+        let policy = Mutex::new(CachePolicy {
+            in_flight: HashMap::from([("dQw4w9WgXcQ".to_owned(), 2)]),
+            ..Default::default()
+        });
+        finish_download(&policy, "dQw4w9WgXcQ");
+        assert_eq!(policy.lock().unwrap().in_flight.get("dQw4w9WgXcQ"), Some(&1));
+        finish_download(&policy, "dQw4w9WgXcQ");
+        assert!(policy.lock().unwrap().in_flight.is_empty());
+        finish_download(&policy, "missing");
+    }
 
     fn make_thumbnail(url: &str, width: u32, height: u32) -> Thumbnail {
         serde_json::from_value(serde_json::json!({

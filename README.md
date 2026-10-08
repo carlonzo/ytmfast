@@ -9,6 +9,7 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 
 ## Features
 
+- Synced lyrics from LRCLIB (fallback: YouTube Music)
 - Home, Explore, search (songs, albums, artists, playlists), album, artist and
   playlist pages
 - Playback with queue, shuffle, repeat and prefetch of the next track
@@ -25,6 +26,8 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 
 ## Install
 
+### Linux
+
 Download the archive for your architecture from the
 [releases page](../../releases), unpack it and put `ytmfast` somewhere on your
 `PATH`:
@@ -34,8 +37,24 @@ tar -xzf ytmfast-*.tar.gz
 install -Dm755 ytmfast ~/.local/bin/ytmfast
 ```
 
-The macOS binary is not signed. If you downloaded it with a browser, clear the
-quarantine flag before running it: `xattr -d com.apple.quarantine ytmfast`.
+### macOS (Apple Silicon)
+
+Download the macOS `.zip` from the [releases page](../../releases), unzip it,
+and drag `ytmfast.app` to `/Applications`. Clear the quarantine flag once for
+this unsigned app, then open it normally from Finder:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ytmfast.app
+```
+
+Install the playback dependencies with Homebrew:
+
+```sh
+brew install yt-dlp deno
+```
+
+Homebrew's `yt-dlp` and `deno` are found automatically, including when the app
+is opened from Finder.
 
 ## Build from source
 
@@ -74,7 +93,7 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | Path | Contents |
 | --- | --- |
 | `~/.config/ytmfast/` | Cookies (only when signed in) |
-| `~/.cache/ytmfast/audio/` | Downloaded tracks |
+| `~/.cache/ytmfast/audio/` | Downloaded tracks; cache size limit in Settings |
 | `~/.local/share/ytmfast/` | App state |
 
 ## Releasing
