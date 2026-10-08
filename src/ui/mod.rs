@@ -512,6 +512,18 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                     {
                         actions.push(Action::ShowSettings);
                     }
+                    if let Some(newer) = &app.available_update {
+                        let notice = egui::Button::new(
+                            egui::RichText::new(format!("Update to v{}", newer.version))
+                                .color(COLOR_TEXT_PRIMARY)
+                                .size(13.0),
+                        )
+                        .fill(COLOR_ACCENT_RED)
+                        .corner_radius(16);
+                        if ui.add(notice).on_hover_text("Open the release page on GitHub").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&newer.url));
+                        }
+                    }
                 });
             });
         });
@@ -1355,6 +1367,9 @@ pub fn draw_settings_dialog(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<
             if ui.button("Clear cache").clicked() {
                 actions.push(Action::ClearCache);
             }
+            ui.add_space(12.0);
+            ui.heading("About");
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
         });
 }
 

@@ -19,6 +19,8 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 - Cover art cached on disk, so pages you have seen load instantly
 - Media keys and desktop integration through MPRIS
 - Optional sign-in for your library, liked music and private playlists
+- A notice in the top bar when a newer release is out, checked at launch and
+  every 6 hours
 
 ## Requirements
 
@@ -118,9 +120,16 @@ On Linux (macOS uses the matching folders under `~/Library`):
 
 ## Releasing
 
-Push a tag starting with `v`; the release workflow builds Linux x86_64, Linux arm64
-and macOS arm64 and attaches the binaries to a GitHub release:
+The update notice compares the app's version, `version` in `Cargo.toml`, with the
+latest GitHub release. Bump it before tagging:
+
+1. Set `version` in `Cargo.toml`, then run `cargo check` so `Cargo.lock` follows.
+2. Commit both files, then push a tag with the same version. The release
+   workflow refuses a tag that does not match `Cargo.toml`.
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
+
+The workflow builds Linux x86_64, Linux arm64 and macOS arm64 and attaches the
+binaries to a GitHub release.
