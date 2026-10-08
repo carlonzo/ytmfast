@@ -95,6 +95,7 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | `~/.config/ytmfast/` | Cookies (only when signed in) |
 | `~/.cache/ytmfast/audio/` | Downloaded tracks; cache size limit in Settings |
 | `~/.local/share/ytmfast/` | App state |
+| `~/.local/share/applications/ytmfast.desktop`, `~/.local/share/icons/hicolor/scalable/apps/ytmfast.svg` | Launcher entry and icon (Linux), written at startup when missing or when the binary moved |
 
 ## Releasing
 
