@@ -9,6 +9,7 @@ use backend::{
     Track,
 };
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use ui::{Action, Nav, View};
@@ -931,12 +932,45 @@ impl App {
         });
     }
 }
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_extra_paths(path: &OsStr, extra: &[&str]) -> OsString {
+    let mut paths: Vec<_> = if path.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(path).collect()
+    };
+    for entry in extra {
+        let entry = std::path::PathBuf::from(entry);
+        if !paths.contains(&entry) {
+            paths.push(entry);
+        }
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| path.to_os_string())
+}
+
+#[cfg(target_os = "macos")]
+fn add_homebrew_paths() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = with_extra_paths(&path, &["/opt/homebrew/bin", "/usr/local/bin"]);
+    // SAFETY: called first in main, before any other thread exists.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
 fn main() -> eframe::Result {
+    #[cfg(target_os = "macos")]
+    add_homebrew_paths();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("ytmfast")
+        .with_app_id("ytmfast")
+        .with_inner_size([1200.0, 800.0])
+        .with_min_inner_size([800.0, 600.0]);
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(error) => eprintln!("Could not load app icon: {error}"),
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ytmfast")
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([800.0, 600.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -966,6 +1000,25 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_paths_preserve_order_and_add_only_missing_entries() {
+        let path = OsStr::new("/usr/bin:/opt/homebrew/bin:/bin");
+        let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/bin"];
+        let extended = with_extra_paths(path, &extra);
+        assert_eq!(extended, "/usr/bin:/opt/homebrew/bin:/bin:/usr/local/bin");
+        assert_eq!(with_extra_paths(&extended, &extra), extended);
+        assert_eq!(with_extra_paths(path, &[]), path);
+    }
+
+    #[test]
+    fn extra_paths_handle_empty_path() {
+        assert_eq!(
+            with_extra_paths(OsStr::new(""), &["/opt/homebrew/bin", "/usr/local/bin"]),
+            "/opt/homebrew/bin:/usr/local/bin"
+        );
+        assert_eq!(with_extra_paths(OsStr::new(""), &[]), "");
+    }
 
     #[test]
     fn test_settings_default_volume() {
