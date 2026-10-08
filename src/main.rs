@@ -1361,9 +1361,60 @@ fn add_homebrew_paths() {
     unsafe { std::env::set_var("PATH", path) };
 }
 
+/// Contents of the launcher entry pointing at `exe`. `Exec` is quoted per
+/// the Desktop Entry spec so paths with spaces or `$` survive.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_entry(exe: &std::path::Path) -> String {
+    let mut quoted = String::from("\"");
+    for c in exe.display().to_string().chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    format!(
+        "[Desktop Entry]\nType=Application\nName=ytmfast\nGenericName=Music Player\n\
+         Comment=YouTube Music client\nExec={quoted}\nIcon=ytmfast\nTerminal=false\n\
+         Categories=AudioVideo;Audio;Player;\nStartupWMClass=ytmfast\n"
+    )
+}
+
+/// Install (or refresh, when the binary moved) the launcher entry and icon
+/// under `~/.local/share`, so ytmfast shows up in the app launcher. Writes
+/// only when the content differs; failures are logged and ignored.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry() {
+    let (Some(dirs), Ok(exe)) = (directories::BaseDirs::new(), std::env::current_exe()) else {
+        return;
+    };
+    let data = dirs.data_dir();
+    let files: [(std::path::PathBuf, Vec<u8>); 2] = [
+        (
+            data.join("icons/hicolor/scalable/apps/ytmfast.svg"),
+            include_bytes!("../assets/app-icon.svg").to_vec(),
+        ),
+        (data.join("applications/ytmfast.desktop"), desktop_entry(&exe).into_bytes()),
+    ];
+    for (path, content) in files {
+        if std::fs::read(&path).is_ok_and(|old| old == content) {
+            continue;
+        }
+        let res = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, &content));
+        if let Err(e) = res {
+            eprintln!("Could not install {}: {e}", path.display());
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     #[cfg(target_os = "macos")]
     add_homebrew_paths();
+    #[cfg(target_os = "linux")]
+    install_desktop_entry();
 
     // A second launch shows the running window instead of starting again.
     #[cfg(target_os = "linux")]
@@ -1466,6 +1517,14 @@ fn create_app(cc: &eframe::CreationContext<'_>) -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_entry_quotes_exec() {
+        let entry = desktop_entry(std::path::Path::new("/home/a b/$x/ytmfast"));
+        assert!(entry.contains("Exec=\"/home/a b/\\$x/ytmfast\"\n"));
+        assert!(entry.contains("Icon=ytmfast\n"));
+        assert!(entry.contains("StartupWMClass=ytmfast\n"));
+    }
 
     #[test]
     fn extra_paths_preserve_order_and_add_only_missing_entries() {
