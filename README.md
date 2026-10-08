@@ -13,6 +13,10 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 - Home, Explore, search (songs, albums, artists, playlists), album, artist and
   playlist pages
 - Playback with queue, shuffle, repeat and prefetch of the next track
+- Mini player in the YouTube Music phone layout, for a small window on a
+  side screen; it switches to a one-row strip when the window is short
+- Keeps playing when you close the window (see below)
+- Cover art cached on disk, so pages you have seen load instantly
 - Media keys and desktop integration through MPRIS
 - Optional sign-in for your library, liked music and private playlists
 
@@ -78,11 +82,26 @@ Only `youtube.com` and `google.com` cookies are kept. They are stored in
 out. These cookies give full access to your Google session for YouTube, so
 treat that file like a password.
 
+## Closing the window
+
+Closing the window while music is paused or stopped quits ytmfast. Closing it
+while music plays keeps the music going:
+
+- **macOS**: the window minimizes to the Dock. Click the Dock icon to bring it
+  back; `Cmd+Q` quits.
+- **Linux**: the window closes and ytmfast keeps running with an icon in the
+  system tray (Waybar's `tray` module on Omarchy, KDE, GNOME with the
+  AppIndicator extension). Click the icon, choose **Show ytmfast** from its
+  menu, or launch ytmfast again to get the window back. **Quit** in the tray
+  menu exits. Media keys and MPRIS (`playerctl`, Waybar's `mpris` module)
+  keep working while the window is closed.
+
 ## Shortcuts
 
 | Key | Action |
 | --- | --- |
 | `Space` | Play / pause |
+| `Ctrl` + `M` (`Cmd` + `Shift` + `M` on macOS) | Mini player / full player |
 | `Alt` + `Left` | Back |
 | `Enter` in the search box | Search |
 
@@ -94,6 +113,7 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | --- | --- |
 | `~/.config/ytmfast/` | Cookies (only when signed in) |
 | `~/.cache/ytmfast/audio/` | Downloaded tracks; cache size limit in Settings |
+| `~/.cache/ytmfast/images/` | Cover art; trimmed to 192 MB at startup once over 256 MB |
 | `~/.local/share/ytmfast/` | App state |
 
 ## Releasing

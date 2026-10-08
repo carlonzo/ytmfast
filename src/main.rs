@@ -1,7 +1,10 @@
 mod audio;
 mod auth;
 mod backend;
+mod images;
 mod lyrics;
+#[cfg(target_os = "linux")]
+mod tray;
 mod ui;
 
 use audio::{Player, Queue};
@@ -11,6 +14,7 @@ use backend::{
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use ui::{Action, Nav, View};
@@ -29,6 +33,12 @@ pub struct Settings {
     pub cache_max_mb: u32,
     #[serde(deserialize_with = "deserialize_prefetch_count")]
     pub prefetch_count: u8,
+    pub mini: bool,
+    pub mini_on_top: bool,
+    /// Window size to go back to when leaving the mini player.
+    pub full_size: [f32; 2],
+    /// Last mini player size, reused the next time it opens.
+    pub mini_size: [f32; 2],
 }
 
 impl Default for Settings {
@@ -43,6 +53,10 @@ impl Default for Settings {
             last_view: View::Home,
             cache_max_mb: 2048,
             prefetch_count: 3,
+            mini: false,
+            mini_on_top: false,
+            full_size: FULL_SIZE,
+            mini_size: MINI_SIZE,
         }
     }
 }
@@ -71,6 +85,10 @@ impl Settings {
             last_view: Self::sanitize_view(app.nav.current.clone()),
             cache_max_mb: app.cache_max_mb,
             prefetch_count: app.prefetch_count,
+            mini: app.mini,
+            mini_on_top: app.mini_on_top,
+            full_size: app.full_size,
+            mini_size: app.mini_size,
         }
     }
 
@@ -84,6 +102,10 @@ impl Settings {
         app.cache_max_mb = self.cache_max_mb;
         app.sent_cache_max_mb = self.cache_max_mb;
         app.prefetch_count = self.prefetch_count.min(10);
+        app.mini = self.mini;
+        app.mini_on_top = self.mini_on_top;
+        app.full_size = sane_size(self.full_size, FULL_SIZE, FULL_MIN);
+        app.mini_size = sane_size(self.mini_size, MINI_SIZE, MINI_MIN);
         app.update_cache_policy();
         // Signed-in state comes from disk + rustypipe, not Settings: a
         // restored private view while signed out would show a broken page.
@@ -96,6 +118,49 @@ impl Settings {
         app.nav = Nav::new(view);
         app.ensure_view_loaded(&app.nav.current.clone());
     }
+}
+
+/// Default and minimum window sizes for the full app and the mini player.
+const FULL_SIZE: [f32; 2] = [1200.0, 800.0];
+const FULL_MIN: [f32; 2] = [800.0, 600.0];
+const MINI_SIZE: [f32; 2] = [340.0, 560.0];
+const MINI_MIN: [f32; 2] = [240.0, 96.0];
+
+/// A stored window size, or `default` when it is missing, not finite, or
+/// below `min` (a corrupt or hand-edited settings file).
+fn sane_size(size: [f32; 2], default: [f32; 2], min: [f32; 2]) -> [f32; 2] {
+    if size.iter().all(|v| v.is_finite()) && size[0] >= min[0] && size[1] >= min[1] {
+        size
+    } else {
+        default
+    }
+}
+
+/// Wakes whichever window is open. On Linux the window is closed in
+/// background mode and a new one (with a new `egui::Context`) is opened
+/// later, so threads hold this instead of a `Context`.
+#[derive(Clone, Default)]
+pub struct Repaint(Arc<Mutex<Option<egui::Context>>>);
+
+impl Repaint {
+    pub fn request_repaint(&self) {
+        if let Some(ctx) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn attach(&self, ctx: Option<&egui::Context>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = ctx.cloned();
+    }
+}
+
+/// Requests from outside the window: the tray icon and a second launch.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum Remote {
+    Show,
+    Quit,
+    Action(Action),
 }
 
 /// True when a cookie jar file exists on disk, i.e. a sign-in (and the
@@ -272,6 +337,26 @@ pub struct App {
     /// Last track actually started, for the PlayList double-click guard.
     last_start: Option<LastStart>,
     pub now_playing: Option<fastframe_now_playing::NowPlaying>,
+    pub repaint: Repaint,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    remote_tx: mpsc::Sender<Remote>,
+    remote_rx: mpsc::Receiver<Remote>,
+    /// Viewport commands from actions, sent by the next `logic` pass.
+    viewport_cmds: Vec<egui::ViewportCommand>,
+    /// The window was closed while music played (Linux): keep running.
+    background: bool,
+    /// Open the window again (Linux background mode).
+    show_requested: bool,
+    /// An explicit Quit: let the close through and exit.
+    quit_requested: bool,
+    /// Mini player state, and the mode the current window was last set up
+    /// for (`None` for a window that has not been set up yet).
+    pub mini: bool,
+    pub mini_on_top: bool,
+    pub full_size: [f32; 2],
+    pub mini_size: [f32; 2],
+    applied_mini: Option<bool>,
+    mode_changed_at: Instant,
 
     // Page cache. Search/collection/artist maps are unbounded for the
     // session (ponytail: add eviction when it matters).
@@ -336,8 +421,9 @@ impl App {
         }
     }
 
-    pub fn new(ctx: egui::Context) -> Self {
-        let backend = Backend::new(ctx);
+    pub fn new(repaint: Repaint) -> Self {
+        let backend = Backend::new(repaint.clone());
+        let (remote_tx, remote_rx) = mpsc::channel();
         let player = Player::new();
         let fetch_error = player.error.clone();
         backend.send(Cmd::LoadHome);
@@ -368,6 +454,19 @@ impl App {
             radio_error: None,
             last_start: None,
             now_playing: None,
+            repaint,
+            remote_tx,
+            remote_rx,
+            viewport_cmds: Vec::new(),
+            background: false,
+            show_requested: false,
+            quit_requested: false,
+            mini: false,
+            mini_on_top: false,
+            full_size: FULL_SIZE,
+            mini_size: MINI_SIZE,
+            applied_mini: None,
+            mode_changed_at: Instant::now(),
             home: None,
             home_loading: true,
             home_error: None,
@@ -681,8 +780,16 @@ impl App {
                     np.seeked(target);
                 }
             }
-            Action::Raise => { /* handled in ui() via viewport cmd */ }
-            Action::Quit => { /* handled in ui() via viewport cmd */ }
+            Action::Raise => self.raise(),
+            Action::Quit => {
+                self.quit_requested = true;
+                self.viewport_cmds.push(egui::ViewportCommand::Close);
+            }
+            Action::ToggleMini => self.mini = !self.mini,
+            Action::ToggleOnTop => {
+                self.mini_on_top = !self.mini_on_top;
+                self.applied_mini = None;
+            }
             Action::PrevTrack => {
                 if self.player.position() > Duration::from_secs(3) {
                     self.player.seek(Duration::ZERO);
@@ -801,10 +908,11 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
+impl App {
+    /// Everything that must keep running without a visible window: backend
+    /// events, auto-advance, media keys, the tray. `ctx` is `None` in Linux
+    /// background mode, where the caller polls on a timer instead.
+    fn tick(&mut self, ctx: Option<&egui::Context>) {
         // Poll backend events
         while let Some(event) = self.backend.try_recv() {
             match event {
@@ -991,13 +1099,15 @@ impl eframe::App for App {
             let age = at.elapsed();
             if age >= RADIO_ERROR_TTL {
                 self.radio_error = None;
-            } else {
+            } else if let Some(ctx) = ctx {
                 ctx.request_repaint_after(RADIO_ERROR_TTL - age);
             }
         }
 
         // Repaint and auto-advance
-        if self.is_loading || (self.is_active_playback && !self.player.is_paused()) {
+        if let Some(ctx) = ctx
+            && (self.is_loading || (self.is_active_playback && !self.player.is_paused()))
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.player.recover_output();
@@ -1020,55 +1130,171 @@ impl eframe::App for App {
                 }
             }
         }
+        while let Ok(remote) = self.remote_rx.try_recv() {
+            actions.push(match remote {
+                Remote::Show => Action::Raise,
+                Remote::Quit => Action::Quit,
+                Remote::Action(action) => action,
+            });
+        }
+        for action in actions {
+            self.apply_action(action);
+        }
+        self.push_mpris_state();
+    }
+
+    /// Music is playing or about to: closing the window keeps the app.
+    fn keeps_playing(&self) -> bool {
+        self.is_active_playback && (self.is_loading || !self.player.is_paused())
+    }
+
+    fn raise(&mut self) {
+        if self.background {
+            self.show_requested = true;
+            return;
+        }
+        self.viewport_cmds.extend([
+            egui::ViewportCommand::Minimized(false),
+            egui::ViewportCommand::Visible(true),
+            egui::ViewportCommand::Focus,
+        ]);
+    }
+
+    /// Close button: quit when nothing plays, otherwise keep the music going.
+    /// macOS minimizes to the Dock; Linux closes the window and keeps
+    /// running behind the tray icon (see `main`).
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested())
+            || self.quit_requested
+            || !self.keeps_playing()
+        {
+            return;
+        }
+        if cfg!(target_os = "linux") {
+            self.background = true;
+        } else if cfg!(target_os = "macos") {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
+    /// Size limits, size and window level for the current mode, sent when
+    /// the mode changes and once for every new window.
+    fn sync_window_mode(&mut self, ctx: &egui::Context) {
+        let settled = self.mode_changed_at.elapsed() > Duration::from_secs(1);
+        if self.applied_mini == Some(self.mini)
+            && settled
+            && let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()))
+        {
+            let size = [size.x, size.y];
+            if self.mini {
+                self.mini_size = sane_size(size, self.mini_size, MINI_MIN);
+            } else {
+                self.full_size = sane_size(size, self.full_size, FULL_MIN);
+            }
+        }
+        if self.applied_mini == Some(self.mini) {
+            return;
+        }
+        let switching = self.applied_mini.is_some_and(|mini| mini != self.mini);
+        let (min, size) = if self.mini {
+            (MINI_MIN, self.mini_size)
+        } else {
+            (FULL_MIN, self.full_size)
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min.into()));
+        // A new window restores its last geometry; only the mini player is
+        // also resized then, in case that geometry was the full window's.
+        if switching || self.mini {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.into()));
+            self.mode_changed_at = Instant::now();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.mini && self.mini_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
+        self.applied_mini = Some(self.mini);
+    }
+
+    fn flush_viewport_cmds(&mut self, ctx: &egui::Context) {
+        for cmd in self.viewport_cmds.drain(..) {
+            ctx.send_viewport_cmd(cmd);
+        }
+    }
+}
+
+/// The eframe side of one window. The `App` outlives it: on Linux the
+/// window can close while music keeps playing, and a later window picks
+/// the same `App` back up.
+struct Window<'a> {
+    app: &'a mut App,
+}
+
+impl eframe::App for Window<'_> {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let app = &mut *self.app;
+        app.tick(Some(ctx));
+        app.handle_close_request(ctx);
+        app.sync_window_mode(ctx);
+        app.flush_viewport_cmds(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let app = &mut *self.app;
+        let ctx = ui.ctx().clone();
+        let mut actions = Vec::new();
+        ui::set_playing(&ctx, app.keeps_playing() && !app.is_loading);
 
         // Keyboard shortcuts:
         // Space toggles play/pause only when no widget has keyboard focus
         if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             actions.push(Action::TogglePlayPause);
         }
-
-        // Back shortcuts: Mouse extra1 and Alt+Left
-        let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
-        let alt_left = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft));
-        if (mouse_back || alt_left) && self.nav.can_back() {
-            actions.push(Action::Back);
+        // Mini player: Ctrl+M, or Cmd+Shift+M on macOS (Cmd+M minimizes).
+        let mini_keys = if cfg!(target_os = "macos") {
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::COMMAND
+        };
+        if ctx.input_mut(|i| i.consume_key(mini_keys, egui::Key::M)) {
+            actions.push(Action::ToggleMini);
         }
 
-        // Draw layout
-        ui::draw_top_bar(ui, self, &mut actions);
-        ui::draw_left_sidebar(ui, self, &mut actions);
-        ui::draw_player_bar(ui, self, &mut actions);
-        if self.queue_open {
-            ui::draw_queue_panel(ui, self, &mut actions);
-        } else if self.lyrics_open {
-            ui::lyrics::draw_lyrics_panel(ui, self, &mut actions);
-        }
-        ui::draw_central_panel(ui, self, &mut actions);
-        ui::draw_sign_in_dialog(ui, self, &mut actions);
-        ui::draw_settings_dialog(ui, self, &mut actions);
-
-        // Apply actions (Raise/Quit need the viewport, so handle inline)
-        let mut viewport_cmds = Vec::new();
-        let mut rest = Vec::new();
-        for action in actions {
-            match action {
-                Action::Raise => viewport_cmds.push(egui::ViewportCommand::Focus),
-                Action::Quit => viewport_cmds.push(egui::ViewportCommand::Close),
-                a => rest.push(a),
+        if app.mini {
+            ui::mini::draw_mini_player(ui, app, &mut actions);
+        } else {
+            // Back shortcuts: Mouse extra1 and Alt+Left
+            let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
+            let alt_left = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft));
+            if (mouse_back || alt_left) && app.nav.can_back() {
+                actions.push(Action::Back);
             }
-        }
-        for action in rest {
-            self.apply_action(action);
-        }
-        for cmd in viewport_cmds {
-            ctx.send_viewport_cmd(cmd);
+
+            ui::draw_top_bar(ui, app, &mut actions);
+            ui::draw_left_sidebar(ui, app, &mut actions);
+            ui::draw_player_bar(ui, app, &mut actions);
+            if app.queue_open {
+                ui::draw_queue_panel(ui, app, &mut actions);
+            } else if app.lyrics_open {
+                ui::lyrics::draw_lyrics_panel(ui, app, &mut actions);
+            }
+            ui::draw_central_panel(ui, app, &mut actions);
+            ui::draw_sign_in_dialog(ui, app, &mut actions);
+            ui::draw_settings_dialog(ui, app, &mut actions);
         }
 
-        self.push_mpris_state();
+        for action in actions {
+            app.apply_action(action);
+        }
+        app.flush_viewport_cmds(&ctx);
+        app.push_mpris_state();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &Settings::from_app(self));
+        eframe::set_value(storage, eframe::APP_KEY, &Settings::from_app(self.app));
     }
 }
 
@@ -1139,11 +1365,55 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "macos")]
     add_homebrew_paths();
 
+    // A second launch shows the running window instead of starting again.
+    #[cfg(target_os = "linux")]
+    let _instance = match tray::SingleInstance::claim() {
+        tray::Claim::Primary(instance) => Some(instance),
+        tray::Claim::Forwarded => return Ok(()),
+        tray::Claim::Unavailable => None,
+    };
+
+    let mut slot: Option<App> = None;
+    loop {
+        run_window(&mut slot)?;
+        let Some(app) = slot.as_mut() else {
+            return Ok(());
+        };
+        if !app.background || app.quit_requested {
+            return Ok(());
+        }
+        // Linux background mode: the window is gone, the music plays on.
+        // Tick on a timer until the tray, MPRIS or a second launch asks for
+        // the window again, or for Quit.
+        app.repaint.attach(None);
+        loop {
+            app.tick(None);
+            app.viewport_cmds.clear();
+            if app.quit_requested {
+                return Ok(());
+            }
+            if app.show_requested {
+                app.show_requested = false;
+                app.background = false;
+                app.applied_mini = None;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Open the window and run it until it closes. The first window creates the
+/// `App` in `slot` (settings come from eframe's storage); later windows
+/// reuse it.
+fn run_window(slot: &mut Option<App>) -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ytmfast")
         .with_app_id("ytmfast")
-        .with_inner_size([1200.0, 800.0])
-        .with_min_inner_size([800.0, 600.0]);
+        .with_inner_size(FULL_SIZE)
+        // The real minimum follows the mode (`sync_window_mode`); start low
+        // so a restored mini player window is not forced to full size.
+        .with_min_inner_size(MINI_MIN);
     match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(error) => eprintln!("Could not load app icon: {error}"),
@@ -1156,24 +1426,41 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ytmfast",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            images::install(&cc.egui_ctx);
             fastframe_icons::install::<ui::Icon>(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
-            let settings: Settings = cc
-                .storage
-                .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
-                .unwrap_or_default();
-            let mut app = App::new(cc.egui_ctx.clone());
-            settings.apply(&mut app);
-            let repaint_ctx = cc.egui_ctx.clone();
-            app.now_playing = Some(fastframe_now_playing::NowPlaying::start(
-                fastframe_now_playing::App::new("ytmfast", "ytmfast"),
-                move || repaint_ctx.request_repaint(),
-            ));
-            Ok(Box::new(app))
+            let app = match slot {
+                Some(app) => app,
+                None => slot.insert(create_app(cc)),
+            };
+            app.repaint.attach(Some(&cc.egui_ctx));
+            Ok(Box::new(Window { app }))
         }),
     )
+}
+
+fn create_app(cc: &eframe::CreationContext<'_>) -> App {
+    let settings: Settings = cc
+        .storage
+        .and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
+        .unwrap_or_default();
+    let repaint = Repaint::default();
+    repaint.attach(Some(&cc.egui_ctx));
+    let mut app = App::new(repaint.clone());
+    settings.apply(&mut app);
+    let np_repaint = repaint.clone();
+    app.now_playing = Some(fastframe_now_playing::NowPlaying::start(
+        fastframe_now_playing::App::new("ytmfast", "ytmfast"),
+        move || np_repaint.request_repaint(),
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        tray::spawn(app.remote_tx.clone(), repaint.clone());
+        tray::listen(app.remote_tx.clone(), repaint);
+    }
+    app
 }
 
 #[cfg(test)]
@@ -1252,12 +1539,20 @@ mod tests {
             last_view: View::Artist("abc123".to_string()),
             cache_max_mb: 512,
             prefetch_count: 7,
+            mini: true,
+            mini_on_top: true,
+            full_size: [1000.0, 700.0],
+            mini_size: [300.0, 120.0],
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.volume, 0.5);
         assert_eq!(back.cache_max_mb, 512);
         assert_eq!(back.prefetch_count, 7);
+        assert!(back.mini);
+        assert!(back.mini_on_top);
+        assert_eq!(back.full_size, [1000.0, 700.0]);
+        assert_eq!(back.mini_size, [300.0, 120.0]);
         assert!(back.sidebar_collapsed);
         assert!(back.shuffle);
         assert_eq!(back.repeat, audio::Repeat::One);
@@ -1444,6 +1739,18 @@ mod tests {
         assert!(!partial.queue_open);
         assert!(!partial.lyrics_open);
         assert_eq!(partial.last_view, View::Home);
+    }
+
+    #[test]
+    fn test_sane_size_rejects_tiny_and_non_finite() {
+        assert_eq!(sane_size([300.0, 120.0], MINI_SIZE, MINI_MIN), [300.0, 120.0]);
+        assert_eq!(sane_size([100.0, 120.0], MINI_SIZE, MINI_MIN), MINI_SIZE);
+        assert_eq!(sane_size([f32::NAN, 900.0], FULL_SIZE, FULL_MIN), FULL_SIZE);
+        assert_eq!(sane_size([700.0, 900.0], FULL_SIZE, FULL_MIN), FULL_SIZE);
+        let partial: Settings = serde_json::from_str(r#"{"mini": true}"#).unwrap();
+        assert!(partial.mini);
+        assert_eq!(partial.mini_size, MINI_SIZE);
+        assert_eq!(partial.full_size, FULL_SIZE);
     }
 
     #[test]

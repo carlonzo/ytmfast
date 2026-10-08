@@ -496,7 +496,7 @@ fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::Ru
 
 async fn fail_auth(
     event_tx: &mpsc::Sender<Event>,
-    ctx: &egui::Context,
+    ctx: &crate::Repaint,
     rp: Option<&Arc<rustypipe::client::RustyPipe>>,
     cookies: &std::sync::RwLock<Option<PathBuf>>,
     cookie_file: &Path,
@@ -560,7 +560,7 @@ async fn fetch_lyrics(
 }
 
 impl Backend {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: crate::Repaint) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
 

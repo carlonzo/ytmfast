@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit"] }
 egui = "0.36"
-egui_extras = { version = "0.36", features = ["http", "image", "svg"] }
+egui_extras = { version = "0.36", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 rustypipe = { version = "0.11.4", features = ["rustls-tls-native-roots", "userdata"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time"] }
@@ -17,3 +17,6 @@ fastframe-now-playing = { git = "https://github.com/crmne/fastframe", tag = "v0.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["tokio", "blocking"] }
