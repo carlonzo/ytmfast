@@ -117,6 +117,7 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | `~/.cache/ytmfast/audio/` | Downloaded tracks; cache size limit in Settings |
 | `~/.cache/ytmfast/images/` | Cover art; trimmed to 192 MB at startup once over 256 MB |
 | `~/.local/share/ytmfast/` | App state |
+| `~/.local/share/applications/ytmfast.desktop`, `~/.local/share/icons/hicolor/scalable/apps/ytmfast.svg` | Launcher entry and icon (Linux), written at startup when missing or when the binary moved |
 
 ## Releasing
 
