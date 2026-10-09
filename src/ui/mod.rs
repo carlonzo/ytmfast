@@ -1,5 +1,6 @@
 pub mod library;
 pub mod lyrics;
+pub mod mini;
 pub mod pages;
 
 use std::time::Duration;
@@ -45,6 +46,10 @@ fastframe_icons::icons! {
         Refresh => lucide "refresh-cw",
         Close => lucide "x",
         Alert => lucide "circle-alert",
+        Mini => lucide "minimize-2",
+        Expand => lucide "maximize-2",
+        Pin => lucide "pin",
+        PinOff => lucide "pin-off",
     }
 }
 
@@ -195,6 +200,8 @@ pub enum Action {
     SeekRelative(i64),
     Raise,
     Quit,
+    ToggleMini,
+    ToggleOnTop,
     Navigate(View),
     Back,
     ToggleSidebar,
@@ -216,6 +223,102 @@ pub fn format_duration(d: Duration) -> String {
 
 pub fn format_secs(s: u32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// How much of the cover's colour the player bar takes.
+const PLAYER_BAR_TINT: f32 = 0.16;
+/// How long the cover-coloured tint takes to follow a new song.
+const TINT_FADE_SECONDS: f32 = 0.45;
+
+/// `base` tinted toward the cover's `accent` by `strength`, eased over
+/// `TINT_FADE_SECONDS` so a song change fades instead of jumping. After
+/// spotifast's player bar (MIT).
+pub fn eased_tint(
+    ctx: &egui::Context,
+    salt: &'static str,
+    base: egui::Color32,
+    accent: Option<egui::Color32>,
+    strength: f32,
+) -> egui::Color32 {
+    let target = accent.map_or(base, |accent| base.lerp_to_gamma(accent, strength));
+    let [r, g, b, _] = target.to_array();
+    let channel = |axis: &'static str, value: u8| {
+        ctx.animate_value_with_time(egui::Id::new((salt, axis)), f32::from(value), TINT_FADE_SECONDS)
+            .round() as u8
+    };
+    egui::Color32::from_rgb(channel("r", r), channel("g", g), channel("b", b))
+}
+
+/// Click-or-drag seeking on `bar`. Returns the fraction to draw and the
+/// position to show (the drag preview while dragging), and pushes a `Seek`
+/// on release.
+pub fn seek_interaction(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    bar: egui::Rect,
+    pos: Duration,
+    total: Duration,
+    actions: &mut Vec<Action>,
+) -> (f32, Duration) {
+    let drag_id = resp.id.with("drag_fraction");
+    let mut drag_frac: Option<f32> = ui.data_mut(|d| d.get_temp(drag_id));
+    let at = |p: egui::Pos2| ((p.x - bar.min.x) / bar.width()).clamp(0.0, 1.0);
+    if resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            drag_frac = Some(at(p));
+            ui.data_mut(|d| d.insert_temp(drag_id, at(p)));
+        }
+    } else if resp.clicked() || resp.drag_stopped() {
+        if let Some(frac) = resp.interact_pointer_pos().map(at).or(drag_frac) {
+            actions.push(Action::Seek(Duration::from_secs_f32(frac * total.as_secs_f32())));
+        }
+        drag_frac = None;
+        ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
+    } else if drag_frac.is_some() {
+        drag_frac = None;
+        ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
+    }
+    let played = if total.as_secs_f32() > 0.0 {
+        (pos.as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    match drag_frac {
+        Some(frac) => (frac, Duration::from_secs_f32(frac * total.as_secs_f32())),
+        None => (played, pos),
+    }
+}
+
+const PLAYING_ID: &str = "ytmfast-now-playing";
+
+/// Record once per frame whether music is audibly playing, for the
+/// now-playing bars drawn deep inside rows.
+pub fn set_playing(ctx: &egui::Context, playing: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PLAYING_ID), playing));
+}
+
+/// Three bouncing bars marking the playing track; still while paused.
+pub fn playing_bars(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    let playing = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new(PLAYING_ID))).unwrap_or(false);
+    let time = ui.input(|i| i.time) as f32;
+    let bar_w = rect.width() / 5.0;
+    for (i, (speed, phase)) in [(7.0, 0.0), (9.5, 1.7), (6.0, 3.1)].into_iter().enumerate() {
+        let level = if playing {
+            0.35 + 0.65 * (0.5 + 0.5 * (time * speed + phase).sin())
+        } else {
+            [0.45, 0.8, 0.6][i]
+        };
+        let h = rect.height() * level;
+        let x = rect.left() + bar_w * (2 * i) as f32;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x, rect.bottom() - h), egui::pos2(x + bar_w, rect.bottom())),
+            egui::CornerRadius::same(1),
+            color,
+        );
+    }
+    if playing {
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
 }
 
 pub fn apply_theme(ctx: &egui::Context) {
@@ -621,12 +724,18 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
 }
 
 pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
+    let accent = app
+        .queue
+        .current()
+        .and_then(|t| t.thumb_url.as_deref())
+        .and_then(|url| crate::images::shared().accent(ui.ctx(), url));
+    let fill = eased_tint(ui.ctx(), "player-bar-tint", COLOR_SURFACE, accent, PLAYER_BAR_TINT);
     egui::Panel::bottom("bottom_panel")
         .exact_size(72.0)
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
-                .fill(COLOR_SURFACE)
+                .fill(fill)
                 .inner_margin(egui::Margin::symmetric(0, 0)),
         )
         .show(ui, |ui| {
@@ -636,45 +745,14 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 Duration::from_secs(cur_track.map(|t| t.duration_secs as u64).unwrap_or(0))
             });
 
-            let fraction = if total_dur.as_secs_f32() > 0.0 {
-                (cur_pos.as_secs_f32() / total_dur.as_secs_f32()).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-
-            let drag_id = ui.id().with("progress_drag_fraction");
-            let mut drag_frac: Option<f32> = ui.data_mut(|d| d.get_temp(drag_id));
-
             let total_width = ui.available_width();
             let (bar_rect, bar_resp) = ui.allocate_exact_size(
                 egui::vec2(total_width, 4.0),
                 egui::Sense::click_and_drag(),
             );
-
-            if bar_resp.dragged() {
-                if let Some(pos) = bar_resp.interact_pointer_pos() {
-                    let frac = ((pos.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                    drag_frac = Some(frac);
-                    ui.data_mut(|d| d.insert_temp(drag_id, frac));
-                }
-            } else if bar_resp.clicked() || bar_resp.drag_stopped() {
-                let final_frac = bar_resp
-                    .interact_pointer_pos()
-                    .map(|pos| ((pos.x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0))
-                    .or(drag_frac);
-
-                if let Some(frac) = final_frac {
-                    let target = Duration::from_secs_f32(frac * total_dur.as_secs_f32());
-                    actions.push(Action::Seek(target));
-                }
-                drag_frac = None;
-                ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
-            } else if drag_frac.is_some() {
-                drag_frac = None;
-                ui.data_mut(|d| d.remove_temp::<f32>(drag_id));
-            }
-
-            let display_fraction = drag_frac.unwrap_or(fraction);
+            let (display_fraction, preview_pos) =
+                seek_interaction(ui, &bar_resp, bar_rect, cur_pos, total_dur, actions);
+            let dragging = bar_resp.dragged();
 
             ui.painter().rect_filled(
                 bar_rect,
@@ -690,7 +768,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 egui::CornerRadius::ZERO,
                 COLOR_ACCENT_RED,
             );
-            if bar_resp.hovered() || bar_resp.dragged() || drag_frac.is_some() {
+            if bar_resp.hovered() || dragging {
                 let circle_center = egui::pos2(
                     bar_rect.min.x + bar_rect.width() * display_fraction,
                     bar_rect.center().y,
@@ -733,9 +811,6 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 }
 
                 ui.add_space(8.0);
-                let preview_pos = drag_frac
-                    .map(|f| Duration::from_secs_f32(f * total_dur.as_secs_f32()))
-                    .unwrap_or(cur_pos);
                 let time_str =
                     format!("{} / {}", format_duration(preview_pos), format_duration(total_dur));
                 ui.label(
@@ -747,7 +822,21 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(16.0);
 
-                    // Right-to-left order on screen: volume, repeat, shuffle, lyrics, queue.
+                    // Right-to-left order on screen: volume, repeat, shuffle, lyrics, queue, mini.
+                    let mini_tip = if cfg!(target_os = "macos") {
+                        "Mini player (Cmd+Shift+M)"
+                    } else {
+                        "Mini player (Ctrl+M)"
+                    };
+                    if ui
+                        .add(egui::Button::image(Icon::Mini.image(COLOR_TEXT_SECONDARY, 18.0)).frame(false))
+                        .on_hover_text(mini_tip)
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleMini);
+                    }
+                    ui.add_space(8.0);
+
                     let queue_color = if app.queue_open {
                         COLOR_ACCENT_RED
                     } else {
@@ -1025,12 +1114,13 @@ fn draw_queue_row_body(
     ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
-            if let Some(url) = &track.thumb_url {
+            let thumb = if let Some(url) = &track.thumb_url {
                 ui.add(
                     egui::Image::from_uri(url)
                         .fit_to_exact_size(egui::vec2(40.0, 40.0))
                         .corner_radius(4),
-                );
+                )
+                .rect
             } else {
                 let (r, _) =
                     ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
@@ -1038,6 +1128,15 @@ fn draw_queue_row_body(
                     r,
                     egui::CornerRadius::same(4),
                     egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                );
+                r
+            };
+            if is_current {
+                ui.painter().rect_filled(thumb, egui::CornerRadius::same(4), egui::Color32::from_black_alpha(150));
+                playing_bars(
+                    ui,
+                    egui::Rect::from_center_size(thumb.center(), egui::vec2(16.0, 16.0)),
+                    COLOR_TEXT_PRIMARY,
                 );
             }
             ui.add_space(8.0);
@@ -1308,11 +1407,10 @@ pub fn draw_track_row(
                             .fit_to_exact_size(egui::vec2(16.0, 16.0)),
                     );
                 } else if is_current {
-                    ui.put(
-                        btn_rect,
-                        egui::Image::new(Icon::Play.uri())
-                            .tint(COLOR_ACCENT_RED)
-                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                    playing_bars(
+                        ui,
+                        egui::Rect::from_center_size(btn_rect.center(), egui::vec2(14.0, 14.0)),
+                        COLOR_ACCENT_RED,
                     );
                 } else {
                     ui.painter().text(
@@ -1346,6 +1444,18 @@ pub fn draw_track_row(
                     );
                 }
 
+                if is_current && !(resp.hovered() || thumb_resp.hovered()) {
+                    ui.painter().rect_filled(
+                        thumb_rect,
+                        egui::CornerRadius::same(4),
+                        egui::Color32::from_black_alpha(150),
+                    );
+                    playing_bars(
+                        ui,
+                        egui::Rect::from_center_size(thumb_rect.center(), egui::vec2(16.0, 16.0)),
+                        COLOR_TEXT_PRIMARY,
+                    );
+                }
                 if resp.hovered() || thumb_resp.hovered() {
                     ui.painter().rect_filled(
                         thumb_rect,

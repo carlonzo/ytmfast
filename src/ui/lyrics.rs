@@ -7,6 +7,9 @@ use crate::{
 };
 use std::time::Duration;
 
+/// How long a lyric line takes to light up or fade.
+const LIGHT_UP_SECONDS: f32 = 0.22;
+
 pub fn draw_lyrics_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     egui::Panel::right("lyrics_panel")
         .exact_size(360.0)
@@ -103,13 +106,23 @@ pub fn draw_lyrics_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                 .max_height((ui.available_height() - 28.0).max(0.0))
                 .show(ui, |ui| {
                     for (index, line) in lyrics.lines.iter().enumerate() {
-                        let color = if !lyrics.synced || active == Some(index) {
-                            COLOR_TEXT_PRIMARY
-                        } else if active.is_some_and(|active| index < active) {
+                        // The sung line lights up and the previous one fades
+                        // over LIGHT_UP_SECONDS instead of switching (spotifast).
+                        let lit = if lyrics.synced {
+                            ui.ctx().animate_bool_with_time(
+                                ui.id().with(("lyric-line", index)),
+                                active == Some(index),
+                                LIGHT_UP_SECONDS,
+                            )
+                        } else {
+                            1.0
+                        };
+                        let rest = if active.is_some_and(|active| index < active) {
                             COLOR_TEXT_SECONDARY
                         } else {
                             egui::Color32::from_gray(0x77)
                         };
+                        let color = rest.lerp_to_gamma(COLOR_TEXT_PRIMARY, lit);
                         let mut text = egui::RichText::new(if line.text.is_empty() {
                             " "
                         } else {
@@ -117,7 +130,7 @@ pub fn draw_lyrics_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
                         })
                         .size(20.0)
                         .color(color);
-                        if lyrics.synced && active == Some(index) {
+                        if lyrics.synced && lit > 0.5 {
                             text = text.strong();
                         }
                         let response = ui.add(egui::Label::new(text).wrap().sense(
