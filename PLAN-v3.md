@@ -81,6 +81,25 @@ Roughly in order of value for the effort. Paths are in crmne/spotifast (MIT).
 12. **macOS notch / Touch Bar / Windows thumbbar** (`src/mac_notch.rs`,
     `src/thumbbar.rs`). Platform extras.
 
+## Delegation (v3 round 2)
+
+Split by file ownership so the two run in parallel, each on its own branch:
+
+| Agent | Branch | Prompt | Items |
+| --- | --- | --- | --- |
+| codex | `v3-audio` | `.prompts/v3-codex.txt` | 1 visualiser, 9 equalizer + limiter, 4 play history, 5 CLI control |
+| agy | `v3-ui` | `.prompts/v3-agy.txt` | palette, 2 Omarchy theme, 7 light/dark, 3 lyrics backdrop, 6 shortcuts, 8 colour emoji |
+
+codex owns `audio.rs`, `backend.rs`, `tray.rs` and the player bar; agy owns
+colours/theme, `lyrics.rs` and shortcuts. Merge `v3-audio` first; agy then
+merges it into `v3-ui` (its palette refactor touches the player bar).
+Items 10-12 (Winamp skins, MilkDrop, notch/Touch Bar/thumbbar) stay out.
+
+```sh
+delegate .prompts/v3-codex.txt codex gpt-6.1-sol
+delegate .prompts/v3-agy.txt agy <model>
+```
+
 ## Not covered / follow-ups
 - macOS was not built locally (no Apple toolchain in this environment); the
   minimize-on-close path uses only egui viewport commands.
