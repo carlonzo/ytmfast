@@ -6,6 +6,7 @@ mod lyrics;
 #[cfg(target_os = "linux")]
 mod tray;
 mod ui;
+mod update;
 
 use audio::{Player, Queue};
 use backend::{
@@ -357,6 +358,8 @@ pub struct App {
     pub mini_size: [f32; 2],
     applied_mini: Option<bool>,
     mode_changed_at: Instant,
+    /// Newer release from the latest update check, if there is one.
+    pub available_update: Option<update::Release>,
 
     // Page cache. Search/collection/artist maps are unbounded for the
     // session (ponytail: add eviction when it matters).
@@ -467,6 +470,7 @@ impl App {
             mini_size: MINI_SIZE,
             applied_mini: None,
             mode_changed_at: Instant::now(),
+            available_update: None,
             home: None,
             home_loading: true,
             home_error: None,
@@ -1088,6 +1092,9 @@ impl App {
                     }
                     self.library_loading = false;
                     self.library_error = Some(error);
+                }
+                Event::UpdateChecked(newer) => {
+                    self.available_update = newer;
                 }
             }
         }

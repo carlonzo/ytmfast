@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit"] }
+# "links" lets egui open the release page in a browser. eframe enables it by default; this file turns defaults off.
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit", "links"] }
 egui = "0.36"
 egui_extras = { version = "0.36", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -17,6 +18,7 @@ fastframe-now-playing = { git = "https://github.com/crmne/fastframe", tag = "v0.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+semver = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["tokio", "blocking"] }

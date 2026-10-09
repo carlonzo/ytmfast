@@ -134,6 +134,8 @@ pub enum Event {
     Auth { signed_in: bool, error: Option<String> },
     Library { generation: u64, library: Library },
     LibraryError { generation: u64, error: String },
+    /// Result of an update check: the newer release, or `None` when this build is current.
+    UpdateChecked(Option<crate::update::Release>),
 }
 
 pub fn select_thumbnail_min(covers: &[rustypipe::model::Thumbnail], min_width: u32) -> Option<String> {
@@ -641,6 +643,10 @@ impl Backend {
                 let _ = rt.block_on(rp.user_auth_remove_cookie());
             }
             let _guard = rt.as_ref().map(|r| r.enter());
+            // Update checks run for as long as the app does, on the same runtime.
+            if let Some(rt_ref) = &rt {
+                rt_ref.spawn(crate::update::watch(event_tx.clone(), ctx.clone()));
+            }
             let lyrics_http = reqwest::Client::builder().timeout(Duration::from_secs(10))
                 .build().map_err(|e| format!("Lyrics HTTP client init error: {e}"));
             let prefetch_slots = Arc::new(tokio::sync::Semaphore::new(2));
