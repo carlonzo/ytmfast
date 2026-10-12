@@ -136,6 +136,17 @@ pub fn has_cookies(filtered: &str) -> bool {
     })
 }
 
+/// True iff the jar holds a Google login cookie (`SAPISID` or its
+/// `__Secure-` variants). A jar without one cannot authenticate, which is
+/// what a browser import yields when cookie decryption failed.
+pub fn has_login_cookie(jar: &str) -> bool {
+    jar.lines().any(|line| {
+        line.split('\t')
+            .nth(5)
+            .is_some_and(|name| name == "SAPISID" || name.ends_with("PAPISID"))
+    })
+}
+
 /// Lock the cookie dir to mode 0700: create it when missing, tighten it
 /// EVERY time (it may pre-exist with wider permissions). Refuses when the
 /// path is a symlink or not a directory. Rationale: a live private copy
@@ -432,6 +443,15 @@ mod tests {
         assert!(has_cookies(
             "# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tval\n"
         ));
+    }
+
+    #[test]
+    fn test_has_login_cookie() {
+        let line = |name: &str| format!(".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\tval\n");
+        assert!(!has_login_cookie(COOKIE_FILE_HEADER));
+        assert!(!has_login_cookie(&line("VISITOR_INFO1_LIVE")));
+        assert!(has_login_cookie(&line("SAPISID")));
+        assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-3PAPISID"))));
     }
 
     #[test]

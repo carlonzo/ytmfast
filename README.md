@@ -29,6 +29,10 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on `PATH`, kept up to date. It
   fetches the audio; recent versions also need a JavaScript runtime such as
   `deno`.
+- Linux, optional: yt-dlp's `secretstorage` Python module
+  (`python-secretstorage` on Arch, `python3-secretstorage` on Debian/Ubuntu
+  and Fedora). Needed to sign in by importing cookies from a Chromium-based
+  browser that keeps its cookie key in the GNOME keyring.
 
 ## Install
 
@@ -118,19 +122,3 @@ On Linux (macOS uses the matching folders under `~/Library`):
 | `~/.cache/ytmfast/images/` | Cover art; trimmed to 192 MB at startup once over 256 MB |
 | `~/.local/share/ytmfast/` | App state |
 | `~/.local/share/applications/ytmfast.desktop`, `~/.local/share/icons/hicolor/scalable/apps/ytmfast.svg` | Launcher entry and icon (Linux), written at startup when missing or when the binary moved |
-
-## Releasing
-
-The update notice compares the app's version, `version` in `Cargo.toml`, with the
-latest GitHub release. Bump it before tagging:
-
-1. Set `version` in `Cargo.toml`, then run `cargo check` so `Cargo.lock` follows.
-2. Commit both files, then push a tag with the same version. The release
-   workflow refuses a tag that does not match `Cargo.toml`.
-
-```sh
-git tag v0.1.1 && git push origin v0.1.1
-```
-
-The workflow builds Linux x86_64, Linux arm64 and macOS arm64 and attaches the
-binaries to a GitHub release.

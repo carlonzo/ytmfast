@@ -1041,38 +1041,63 @@ impl Backend {
                                                     .ok_or_else(|| {
                                                         format!("Unsupported browser: {browser}")
                                                     })?;
-                                            // 0600 placeholder BEFORE content lands.
-                                            crate::auth::write_cookie_file(
-                                                cookie_file,
-                                                crate::auth::COOKIE_FILE_HEADER,
-                                            )
-                                            .await?;
-                                            let out = tokio::time::timeout(
-                                                Duration::from_secs(60),
-                                                tokio::process::Command::new("yt-dlp")
-                                                    .args(&args)
-                                                    .kill_on_drop(true)
-                                                    .output(),
-                                            )
-                                            .await
-                                            .map_err(|_| {
-                                                "Browser import timed out".to_string()
-                                            })?
-                                            .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
-                                            let stderr =
-                                                String::from_utf8_lossy(&out.stderr).into_owned();
-                                            // yt-dlp exits 1 on the probe URL ("Unsupported
-                                            // URL") but still saves the jar on close: do NOT
-                                            // gate on exit status. Only the file counts.
-                                            let raw =
-                                                tokio::fs::read_to_string(cookie_file).await.map_err(
-                                                    |_| {
+                                            // yt-dlp only auto-detects the keyring on
+                                            // GNOME/KDE; elsewhere (Hyprland, sway...) it
+                                            // assumes none, so Chromium cookies encrypted via
+                                            // libsecret fail to decrypt. Retry with the GNOME
+                                            // keyring when the first jar has no login cookie.
+                                            let try_keyring =
+                                                cfg!(target_os = "linux") && browser != "firefox";
+                                            let mut raw = String::new();
+                                            let mut stderr = String::new();
+                                            for keyring in [false, true] {
+                                                if keyring && !try_keyring {
+                                                    break;
+                                                }
+                                                let mut args = args.clone();
+                                                if keyring {
+                                                    args[1] = format!("{browser}+gnomekeyring");
+                                                }
+                                                // 0600 placeholder BEFORE content lands.
+                                                crate::auth::write_cookie_file(
+                                                    cookie_file,
+                                                    crate::auth::COOKIE_FILE_HEADER,
+                                                )
+                                                .await?;
+                                                let out = tokio::time::timeout(
+                                                    Duration::from_secs(60),
+                                                    tokio::process::Command::new("yt-dlp")
+                                                        .args(&args)
+                                                        .kill_on_drop(true)
+                                                        .output(),
+                                                )
+                                                .await
+                                                .map_err(|_| {
+                                                    "Browser import timed out".to_string()
+                                                })?
+                                                .map_err(|e| {
+                                                    format!("Failed to run yt-dlp: {e}")
+                                                })?;
+                                                stderr = String::from_utf8_lossy(&out.stderr)
+                                                    .into_owned();
+                                                // yt-dlp exits 1 on the probe URL ("Unsupported
+                                                // URL") but still saves the jar on close: do NOT
+                                                // gate on exit status. Only the file counts.
+                                                raw = tokio::fs::read_to_string(cookie_file)
+                                                    .await
+                                                    .map_err(|_| {
                                                         format!(
                                                             "Browser import failed: {}",
                                                             crate::auth::short_error(&stderr)
                                                         )
-                                                    },
-                                                )?;
+                                                    })?;
+                                                if crate::auth::has_login_cookie(&raw) {
+                                                    break;
+                                                }
+                                                if keyring && stderr.contains("secretstorage") {
+                                                    return Err("No login cookies found. If you are signed in there, the browser keeps its key in the GNOME keyring and yt-dlp needs the secretstorage module to read it: install python-secretstorage (Arch) or python3-secretstorage (Debian/Fedora), then retry.".to_string());
+                                                }
+                                            }
                                             (raw, Some(stderr))
                                         }
                                         SignInSource::File(path) => {

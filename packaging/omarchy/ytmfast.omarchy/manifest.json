@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "ytmfast.omarchy",
+  "name": "ytmfast",
+  "version": "1.0.0",
+  "author": "Carlo Marinangeli",
+  "description": "ytmfast's tray icon as an Omarchy bar plugin: controls, now playing, Open and Quit.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "ytmfast",
+    "description": "Now-playing controls for ytmfast, with Open and Quit.",
+    "category": "Media",
+    "allowMultiple": false
+  }
+}
