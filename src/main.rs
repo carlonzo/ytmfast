@@ -1506,6 +1506,13 @@ fn run_window(slot: &mut Option<App>) -> eframe::Result {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // With vsync, a repaint while the window is on another workspace can
+        // block in the buffer swap. The UI thread then stops answering the
+        // compositor's pings and Hyprland shows "not responding".
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
