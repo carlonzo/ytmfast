@@ -316,8 +316,9 @@ pub fn playing_bars(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
             color,
         );
     }
+    // Every repaint redraws the whole window; 10 fps keeps the bars moving.
     if playing {
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 }
 
