@@ -11,7 +11,7 @@ egui_extras = { version = "0.36", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 rustypipe = { version = "0.11.4", features = ["rustls-tls-native-roots", "userdata"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time"] }
-rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 directories = "6"
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
 fastframe-now-playing = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
