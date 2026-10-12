@@ -10,8 +10,8 @@ mod update;
 
 use audio::{Player, Queue};
 use backend::{
-    ArtistPage, Backend, Cmd, Collection, Event, Home, Library, PageKind, SearchAll, SignInSource,
-    Track,
+    ArtistPage, Backend, Cmd, Collection, Event, Home, Library, PageKind, SearchAll, Shelf,
+    ShelfItem, SignInSource, Track,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -330,7 +330,9 @@ pub struct App {
     pub show_settings: bool,
     pub cache_usage: Option<(u64, usize)>,
     pub radio_pending: Option<String>,
-    /// Transient radio failure notice with its timestamp: shown in the
+    /// A video is being looked up and opened: a second click waits for it.
+    video_pending: bool,
+    /// Transient radio (or video) failure notice with its timestamp: shown in the
     /// player bar but auto-expires after `RADIO_ERROR_TTL` so it never
     /// masquerades as the current track's error. Real fetch errors of the
     /// current track stay in `fetch_error` and do not expire.
@@ -366,6 +368,11 @@ pub struct App {
     pub home: Option<Home>,
     pub home_loading: bool,
     pub home_error: Option<String>,
+    /// YouTube Music's home feed, a page at a time; `feed_loading` until the
+    /// last page. Pages of an older `feed_generation` are dropped.
+    pub feed: Vec<Shelf>,
+    pub feed_loading: bool,
+    feed_generation: u64,
 
     pub search_results: HashMap<String, SearchAll>,
     pub search_loading: HashSet<String>,
@@ -430,6 +437,7 @@ impl App {
         let player = Player::new();
         let fetch_error = player.error.clone();
         backend.send(Cmd::LoadHome);
+        backend.send(Cmd::LoadFeed(0));
 
         Self {
             backend,
@@ -454,6 +462,7 @@ impl App {
             show_settings: false,
             cache_usage: None,
             radio_pending: None,
+            video_pending: false,
             radio_error: None,
             last_start: None,
             now_playing: None,
@@ -474,6 +483,9 @@ impl App {
             home: None,
             home_loading: true,
             home_error: None,
+            feed: Vec::new(),
+            feed_loading: true,
+            feed_generation: 0,
             search_results: HashMap::new(),
             search_loading: HashSet::new(),
             search_errors: HashMap::new(),
@@ -568,6 +580,15 @@ impl App {
             self.player.stop();
             self.update_cache_policy();
         }
+    }
+
+    /// Load the home feed again, for a changed account or a retry. The new
+    /// generation drops pages still on their way from the last request.
+    fn load_feed(&mut self) {
+        self.feed_generation = self.feed_generation.wrapping_add(1);
+        self.feed.clear();
+        self.feed_loading = true;
+        self.backend.send(Cmd::LoadFeed(self.feed_generation));
     }
 
     pub fn navigate(&mut self, view: View) {
@@ -742,6 +763,14 @@ impl App {
                 self.maybe_lyrics();
             }
             Action::RetryLyrics => self.request_lyrics(),
+            Action::WatchVideo => {
+                if !self.video_pending
+                    && let Some(track) = self.queue.current().cloned()
+                {
+                    self.video_pending = true;
+                    self.backend.send(Cmd::Video { track, at: self.player.position() });
+                }
+            }
             Action::ToggleQueue => {
                 self.queue_open = !self.queue_open;
                 if self.queue_open { self.lyrics_open = false; }
@@ -881,6 +910,9 @@ impl App {
                     self.home_loading = true;
                     self.home_error = None;
                     self.backend.send(Cmd::LoadHome);
+                    if self.feed.is_empty() && !self.feed_loading {
+                        self.load_feed();
+                    }
                 }
                 View::Search(q) => {
                     self.search_errors.remove(&q);
@@ -945,6 +977,13 @@ impl App {
                     self.home_loading = false;
                     self.home_error = Some(err);
                 }
+                Event::Feed { generation, shelves, done } => {
+                    if !generation_current(generation, self.feed_generation) {
+                        continue;
+                    }
+                    self.feed.extend(shelves);
+                    self.feed_loading = !done;
+                }
                 Event::SearchResults(res) => {
                     self.search_loading.remove(&res.query);
                     self.search_errors.remove(&res.query);
@@ -954,9 +993,20 @@ impl App {
                     self.search_loading.remove(&query);
                     self.search_errors.insert(query, error);
                 }
-                Event::Collection { generation, collection } => {
+                Event::Collection { generation, mut collection } => {
                     if !generation_current(generation, self.auth_generation) {
                         continue;
+                    }
+                    // A mix comes back without a name or cover (see
+                    // `Cmd::OpenPlaylist`); the feed card that opened it has both.
+                    if collection.thumb_url.is_none()
+                        && let Some(card) = self.feed.iter().flat_map(|shelf| &shelf.items).find_map(|item| match item {
+                            ShelfItem::Card(card) if card.id == collection.id => Some(card),
+                            _ => None,
+                        })
+                    {
+                        collection.title = card.title.clone();
+                        collection.thumb_url = card.thumb_url.clone();
                     }
                     self.collections_loading.remove(&collection.id);
                     self.collection_errors.remove(&collection.id);
@@ -1040,9 +1090,15 @@ impl App {
                     }
                 }
                 Event::Auth { signed_in, error } => {
+                    // The feed asked for at startup is already this account's;
+                    // only a sign-in made here changes whose feed it is.
+                    let signed_in_here = self.sign_in_busy;
                     self.signed_in = signed_in;
                     self.sign_in_busy = false;
                     if signed_in {
+                        if signed_in_here {
+                            self.load_feed();
+                        }
                         let reload = auth_changed(
                             &mut self.auth_generation,
                             &mut self.collections_loading,
@@ -1073,6 +1129,7 @@ impl App {
                         self.library_error = None;
                         self.collections.clear();
                         self.search_errors.clear();
+                        self.load_feed();
                         reload.reload(self);
                     } else {
                         self.auth_error = error;
@@ -1092,6 +1149,21 @@ impl App {
                     }
                     self.library_loading = false;
                     self.library_error = Some(error);
+                }
+                Event::Video(result) => {
+                    self.video_pending = false;
+                    match result {
+                        Ok(url) => {
+                            // The video brings its own sound.
+                            self.apply_action(Action::Pause);
+                            if let (Some(url), Some(ctx)) = (url, ctx) {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+                        Err(error) => {
+                            self.radio_error = Some((format!("Video failed: {error}"), Instant::now()));
+                        }
+                    }
                 }
                 Event::UpdateChecked(newer) => {
                     self.available_update = newer;
@@ -1323,7 +1395,11 @@ impl App {
             title: t.title.clone(),
             artists: vec![t.artist.clone()],
             album: t.album.clone(),
-            duration: Some(Duration::from_secs(t.duration_secs as u64)),
+            // Home feed songs come without a length: the player knows it once loaded.
+            duration: self
+                .player
+                .duration()
+                .or((t.duration_secs > 0).then(|| Duration::from_secs(t.duration_secs as u64))),
             // ponytail: Track carries only the small thumb_url; prefer a large
             // thumbnail here once the backend provides one.
             art_url: t.thumb_url.clone(),
@@ -1506,6 +1582,13 @@ fn run_window(slot: &mut Option<App>) -> eframe::Result {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // With vsync, a repaint while the window is on another workspace can
+        // block in the buffer swap. The UI thread then stops answering the
+        // compositor's pings and Hyprland shows "not responding".
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

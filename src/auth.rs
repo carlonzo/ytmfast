@@ -252,9 +252,15 @@ pub fn liked_card(liked_playlist_id: &str) -> Card {
     }
 }
 
-/// Insert the Liked Music card at the front of the playlist list.
+/// Put Liked Music at the front of the playlist list. YouTube Music already
+/// lists it among the saved playlists (with its cover), so move that entry
+/// instead of adding a second one.
 pub fn with_liked_first(mut playlists: Vec<Card>, liked_playlist_id: &str) -> Vec<Card> {
-    playlists.insert(0, liked_card(liked_playlist_id));
+    let liked = match playlists.iter().position(|p| p.id == liked_playlist_id) {
+        Some(at) => playlists.remove(at),
+        None => liked_card(liked_playlist_id),
+    };
+    playlists.insert(0, liked);
     playlists
 }
 
@@ -366,6 +372,11 @@ mod tests {
         let empty = with_liked_first(Vec::new(), "LM");
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].id, "LM");
+
+        // Already listed by YouTube Music: moved to the front, not duplicated.
+        let listed = Card { id: "LM".to_string(), thumb_url: Some("cover".to_string()), ..mine.clone() };
+        let out = with_liked_first(vec![mine.clone(), listed.clone()], "LM");
+        assert_eq!(out, vec![listed, mine]);
     }
 
     #[test]

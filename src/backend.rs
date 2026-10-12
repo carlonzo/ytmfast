@@ -70,6 +70,20 @@ pub struct Home {
     pub chart_artists: Vec<Card>,
 }
 
+/// One entry of a home feed shelf: a song to play or a page to open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShelfItem {
+    Track(Track),
+    Card(Card),
+}
+
+/// A titled row of YouTube Music's home feed ("Your daily discover", …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shelf {
+    pub title: String,
+    pub items: Vec<ShelfItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchAll {
     pub query: String,
@@ -95,6 +109,7 @@ pub enum SignInSource {
 
 pub enum Cmd {
     LoadHome,
+    LoadFeed(u64),
     Search(String),
     OpenAlbum(String, u64),
     OpenPlaylist(String, u64),
@@ -110,10 +125,14 @@ pub enum Cmd {
     SignIn(SignInSource),
     SignOut,
     LoadLibrary(u64),
+    /// Open the playing track's video in a player window, `at` this position.
+    Video { track: Track, at: Duration },
 }
 
 pub enum Event {
     Home(Home),
+    /// One page of the home feed; `done` on the last one.
+    Feed { generation: u64, shelves: Vec<Shelf>, done: bool },
     Lyrics { id: String, result: Result<Option<crate::lyrics::Lyrics>, String> },
     HomeError(String),
     SearchResults(SearchAll),
@@ -134,6 +153,9 @@ pub enum Event {
     Auth { signed_in: bool, error: Option<String> },
     Library { generation: u64, library: Library },
     LibraryError { generation: u64, error: String },
+    /// The video opened: in mpv (`None`), or it is at this URL for the browser
+    /// to open when there is no mpv.
+    Video(Result<Option<String>, String>),
     /// Result of an update check: the newer release, or `None` when this build is current.
     UpdateChecked(Option<crate::update::Release>),
 }
@@ -350,6 +372,126 @@ pub fn split_artist_albums(
         }
     }
     (albums, singles)
+}
+
+/// How many pages of the home feed to load, three shelves each.
+// ponytail: fetched up front; load further pages on scroll if more are wanted.
+const FEED_PAGES: usize = 5;
+
+/// The text of an InnerTube `runs` list.
+fn runs_text(text: &serde_json::Value) -> String {
+    text["runs"].as_array().into_iter().flatten().filter_map(|run| run["text"].as_str()).collect()
+}
+
+/// Page type and id that `holder`'s endpoint browses to.
+fn browse_target(holder: &serde_json::Value) -> Option<(&str, &str)> {
+    let browse = &holder["navigationEndpoint"]["browseEndpoint"];
+    let page = &browse["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"];
+    Some((page.as_str()?, browse["browseId"].as_str()?))
+}
+
+/// Names of the artists linked in `text`, and the first one's id.
+fn feed_artists(text: &serde_json::Value) -> (String, Option<String>) {
+    let artists: Vec<(&str, &str)> = text["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|run| {
+            let (page, id) = browse_target(run)?;
+            matches!(page, "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL")
+                .then_some((run["text"].as_str()?, id))
+        })
+        .collect();
+    let names: Vec<&str> = artists.iter().map(|(name, _)| *name).collect();
+    (names.join(", "), artists.first().map(|(_, id)| id.to_string()))
+}
+
+/// Cover of a feed item at card size. `thumbnailRenderer` on tiles,
+/// `thumbnail` on list rows, which only offer 60 and 120 px: for those, ask
+/// the image server for the card size instead. A cover that is big enough
+/// keeps its URL, and with it the crop an artist's round picture needs.
+fn feed_thumb(item: &serde_json::Value) -> Option<String> {
+    let covers = ["thumbnailRenderer", "thumbnail"].iter().find_map(|key| {
+        let thumbnails = &item[key]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"];
+        serde_json::from_value::<Vec<rustypipe::model::Thumbnail>>(thumbnails.clone()).ok()
+    })?;
+    let url = select_thumbnail_min(&covers, 226)?;
+    Some(if covers.iter().any(|cover| cover.width >= 226) { url } else { crate::images::sized(&url, 226) })
+}
+
+/// A feed entry as something the app can play or open. `None` for the kinds
+/// it has no page for (podcasts, episodes).
+fn feed_item(item: &serde_json::Value) -> Option<ShelfItem> {
+    if let Some(row) = item.get("musicResponsiveListItemRenderer") {
+        let column = |i: usize| &row["flexColumns"][i]["musicResponsiveListItemFlexColumnRenderer"]["text"];
+        let title = &column(0)["runs"][0];
+        let (artist, artist_id) = feed_artists(column(1));
+        let album = &column(2)["runs"][0];
+        let album_id = browse_target(album)
+            .filter(|(page, _)| *page == "MUSIC_PAGE_TYPE_ALBUM")
+            .map(|(_, id)| id.to_string());
+        return Some(ShelfItem::Track(Track {
+            id: title["navigationEndpoint"]["watchEndpoint"]["videoId"].as_str()?.to_string(),
+            title: title["text"].as_str()?.to_string(),
+            artist,
+            album: album_id.as_ref().and(album["text"].as_str()).unwrap_or_default().to_string(),
+            duration_secs: 0,
+            thumb_url: feed_thumb(row),
+            artist_id,
+            album_id,
+        }));
+    }
+    let tile = item.get("musicTwoRowItemRenderer")?;
+    let title = runs_text(&tile["title"]);
+    let subtitle = runs_text(&tile["subtitle"]);
+    let thumb_url = feed_thumb(tile);
+    if let Some(id) = tile["navigationEndpoint"]["watchEndpoint"]["videoId"].as_str() {
+        let (artist, artist_id) = feed_artists(&tile["subtitle"]);
+        return Some(ShelfItem::Track(Track {
+            id: id.to_string(),
+            title,
+            artist: if artist.is_empty() { subtitle } else { artist },
+            album: String::new(),
+            duration_secs: 0,
+            thumb_url,
+            artist_id,
+            album_id: None,
+        }));
+    }
+    let (page, id) = browse_target(tile)?;
+    let (kind, id) = match page {
+        "MUSIC_PAGE_TYPE_ALBUM" => (CardKind::Album, id),
+        "MUSIC_PAGE_TYPE_ARTIST" => (CardKind::Artist, id),
+        "MUSIC_PAGE_TYPE_PLAYLIST" => (CardKind::Playlist, id.strip_prefix("VL").unwrap_or(id)),
+        _ => return None,
+    };
+    Some(ShelfItem::Card(Card { kind, id: id.to_string(), title, subtitle, thumb_url }))
+}
+
+/// Shelves of one home feed response (`FEmusic_home` or a continuation of
+/// it), and the token for the next page.
+pub fn parse_feed(response: &serde_json::Value) -> (Vec<Shelf>, Option<String>) {
+    let Some(list) = response
+        .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer")
+        .or_else(|| response.pointer("/continuationContents/sectionListContinuation"))
+    else {
+        return (Vec::new(), None);
+    };
+    let shelves = list["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|section| {
+            let shelf = section.get("musicCarouselShelfRenderer")?;
+            let items: Vec<ShelfItem> = shelf["contents"].as_array()?.iter().filter_map(feed_item).collect();
+            (!items.is_empty()).then(|| Shelf {
+                title: runs_text(&shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"]),
+                items,
+            })
+        })
+        .collect();
+    let next = list["continuations"][0]["nextContinuationData"]["continuation"].as_str().map(str::to_string);
+    (shelves, next)
 }
 
 // The backend enforces after every successful fetch/prefetch using the shared
@@ -751,6 +893,28 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
+                            Cmd::LoadFeed(generation) => {
+                                // A page that fails ends the feed quietly: Home
+                                // then shows what it has, or its charts alone.
+                                let mut body = serde_json::json!({ "browseId": "FEmusic_home" });
+                                for page in 0..FEED_PAGES {
+                                    let (shelves, next) = match &rp {
+                                        Some(rp) => authed_query(rp)
+                                            .raw(rustypipe::client::ClientType::DesktopMusic, "browse", &body)
+                                            .await
+                                            .ok()
+                                            .and_then(|text| serde_json::from_str(&text).ok())
+                                            .map(|response| parse_feed(&response))
+                                            .unwrap_or_default(),
+                                        None => Default::default(),
+                                    };
+                                    let next = next.filter(|_| page + 1 < FEED_PAGES);
+                                    let _ = event_tx.send(Event::Feed { generation, shelves, done: next.is_none() });
+                                    ctx.request_repaint();
+                                    let Some(token) = next else { break };
+                                    body = serde_json::json!({ "continuation": token });
+                                }
+                            }
                             Cmd::Search(query) => {
                                 if let Some(rp) = rp {
                                     let q1 = rp.query();
@@ -931,11 +1095,42 @@ impl Backend {
                                             });
                                         }
                                         Err(e) => {
-                                            let _ = event_tx.send(Event::PageError {
-                                                id,
-                                                kind: PageKind::Collection,
-                                                error: e.to_string(),
-                                                generation,
+                                            // A mix ("My Supermix", …) is a radio, not a
+                                            // playlist page: its tracks come from the radio
+                                            // endpoint, without a name or cover.
+                                            let mix = if id.starts_with("RD") {
+                                                q.music_radio(&id).await.ok().filter(|radio| !radio.items.is_empty())
+                                            } else {
+                                                None
+                                            };
+                                            let _ = event_tx.send(match mix {
+                                                Some(radio) => {
+                                                    let tracks: Vec<Track> =
+                                                        radio.items.into_iter().map(track_from).collect();
+                                                    Event::Collection {
+                                                        generation,
+                                                        collection: Collection {
+                                                            id,
+                                                            title: "Mix".to_string(),
+                                                            kind: CardKind::Playlist,
+                                                            subtitle: format_collection_subtitle(
+                                                                CardKind::Playlist,
+                                                                Some("YouTube Music"),
+                                                                None,
+                                                                tracks.len(),
+                                                                tracks.iter().map(|t| t.duration_secs).sum(),
+                                                            ),
+                                                            thumb_url: None,
+                                                            tracks,
+                                                        },
+                                                    }
+                                                }
+                                                None => Event::PageError {
+                                                    id,
+                                                    kind: PageKind::Collection,
+                                                    error: e.to_string(),
+                                                    generation,
+                                                },
                                             });
                                         }
                                     }
@@ -1301,6 +1496,55 @@ impl Backend {
                                 }
                                 ctx.request_repaint();
                             }
+                            Cmd::Video { track, at } => {
+                                // ponytail: the first video search hit by the song's artist, else
+                                // the first hit. The `next` endpoint's counterpart id would give
+                                // YouTube Music's own song-to-video pairing.
+                                let found = match &rp {
+                                    Some(rp) => rp
+                                        .query()
+                                        .music_search_videos(format!("{} {}", track.artist, track.title))
+                                        .await
+                                        .ok()
+                                        .and_then(|found| {
+                                            let videos = found.items.items;
+                                            videos
+                                                .iter()
+                                                .find(|v| v.artists.first().is_some_and(|a| track.artist.contains(&a.name)))
+                                                .or(videos.first())
+                                                .map(|v| v.id.clone())
+                                        }),
+                                    None => None,
+                                };
+                                // No hit: the track's own id still plays, as the
+                                // video it is or as its still cover.
+                                let id = found.unwrap_or(track.id);
+                                let result = if crate::audio::is_valid_id(&id) {
+                                    let url = format!("https://www.youtube.com/watch?v={id}");
+                                    let player = tokio::process::Command::new("mpv")
+                                        .arg("--force-window=immediate")
+                                        .arg(format!("--start={}", at.as_secs()))
+                                        .arg(&url)
+                                        .stdin(std::process::Stdio::null())
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .spawn();
+                                    match player {
+                                        Ok(mut player) => {
+                                            let _ = event_tx.send(Event::Video(Ok(None)));
+                                            ctx.request_repaint();
+                                            // Stay until it closes, so it is reaped.
+                                            let _ = player.wait().await;
+                                            return;
+                                        }
+                                        Err(_) => Ok(Some(format!("{url}&t={}s", at.as_secs()))),
+                                    }
+                                } else {
+                                    Err("no video found".to_string())
+                                };
+                                let _ = event_tx.send(Event::Video(result));
+                                ctx.request_repaint();
+                            }
                             Cmd::Fetch(track) => {
                                 // Skip the private cookie copy entirely when
                                 // the file is already cached: `fetch`
@@ -1396,6 +1640,9 @@ impl Backend {
                         Cmd::LoadHome => {
                             let _ = event_tx.send(Event::HomeError(err));
                         }
+                        Cmd::LoadFeed(generation) => {
+                            let _ = event_tx.send(Event::Feed { generation, shelves: Vec::new(), done: true });
+                        }
                         Cmd::Search(query) => {
                             let _ = event_tx.send(Event::SearchError { query, error: err });
                         }
@@ -1433,6 +1680,9 @@ impl Backend {
                                 generation,
                                 error: err,
                             });
+                        }
+                        Cmd::Video { .. } => {
+                            let _ = event_tx.send(Event::Video(Err(err)));
                         }
                     }
                     ctx.request_repaint();
@@ -1607,6 +1857,125 @@ mod tests {
         assert_eq!(albums[1].id, "ep_1");
         assert_eq!(singles.len(), 1);
         assert_eq!(singles[0].id, "single_1");
+    }
+
+    #[test]
+    fn test_parse_feed_maps_songs_and_pages_and_skips_podcasts() {
+        use serde_json::{Value, json};
+        let browse = |page: &str, id: &str| {
+            json!({"browseEndpoint": {"browseId": id, "browseEndpointContextSupportedConfigs":
+                {"browseEndpointContextMusicConfig": {"pageType": page}}}})
+        };
+        let thumbs = json!({"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [
+            {"url": "https://lh3.googleusercontent.com/x=w60-h60-l90-rj", "width": 60, "height": 60},
+            {"url": "https://lh3.googleusercontent.com/x=w120-h120-l90-rj", "width": 120, "height": 120},
+        ]}}});
+        let tile = |title: &str, endpoint: Value| {
+            json!({"musicTwoRowItemRenderer": {
+                "thumbnailRenderer": thumbs,
+                "title": {"runs": [{"text": title}]},
+                "subtitle": {"runs": [
+                    {"text": "Band", "navigationEndpoint": browse("MUSIC_PAGE_TYPE_ARTIST", "UCband")},
+                    {"text": " • "},
+                    {"text": "3.2M plays"},
+                ]},
+                "navigationEndpoint": endpoint,
+            }})
+        };
+        let column = |runs: Value| json!({"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": runs}}});
+        let row = json!({"musicResponsiveListItemRenderer": {"thumbnail": thumbs, "flexColumns": [
+            column(json!([{"text": "Row Song", "navigationEndpoint": {"watchEndpoint": {"videoId": "rowvideo001"}}}])),
+            column(json!([
+                {"text": "A", "navigationEndpoint": browse("MUSIC_PAGE_TYPE_ARTIST", "UCa")},
+                {"text": " & "},
+                {"text": "B", "navigationEndpoint": browse("MUSIC_PAGE_TYPE_ARTIST", "UCb")},
+                {"text": " • "},
+                {"text": "1M plays"},
+            ])),
+            column(json!([{"text": "The Album", "navigationEndpoint": browse("MUSIC_PAGE_TYPE_ALBUM", "MPREb_1")}])),
+        ]}});
+        let shelf = |title: &str, items: Value| {
+            json!({"musicCarouselShelfRenderer": {
+                "header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [{"text": title}]}}},
+                "contents": items,
+            }})
+        };
+        let podcast = tile("Show", browse("MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE", "MPSPshow"));
+        let list = json!({
+            "contents": [
+                shelf("Your daily discover", json!([
+                    tile("Song", json!({"watchEndpoint": {"videoId": "songvideo01"}})),
+                    row,
+                ])),
+                shelf("Listen again", json!([
+                    tile("Album", browse("MUSIC_PAGE_TYPE_ALBUM", "MPREb_2")),
+                    podcast,
+                    tile("List", browse("MUSIC_PAGE_TYPE_PLAYLIST", "VLPLlist")),
+                    tile("Artist", browse("MUSIC_PAGE_TYPE_ARTIST", "UCx")),
+                ])),
+                shelf("Shows for you", json!([podcast])),
+                {"musicTastebuilderShelfRenderer": {}},
+            ],
+            "continuations": [{"nextContinuationData": {"continuation": "TOKEN"}}],
+        });
+        let first = json!({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [
+            {"tabRenderer": {"content": {"sectionListRenderer": list}}},
+        ]}}});
+
+        let (shelves, next) = parse_feed(&first);
+        assert_eq!(next.as_deref(), Some("TOKEN"));
+        // The podcast-only shelf and the non-shelf section are gone.
+        let titles: Vec<&str> = shelves.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Your daily discover", "Listen again"]);
+
+        let cover = Some("https://lh3.googleusercontent.com/x=w226-h226-l90-rj".to_string());
+        assert_eq!(
+            shelves[0].items,
+            [
+                ShelfItem::Track(Track {
+                    id: "songvideo01".to_string(),
+                    title: "Song".to_string(),
+                    artist: "Band".to_string(),
+                    album: String::new(),
+                    duration_secs: 0,
+                    thumb_url: cover.clone(),
+                    artist_id: Some("UCband".to_string()),
+                    album_id: None,
+                }),
+                ShelfItem::Track(Track {
+                    id: "rowvideo001".to_string(),
+                    title: "Row Song".to_string(),
+                    artist: "A, B".to_string(),
+                    album: "The Album".to_string(),
+                    duration_secs: 0,
+                    thumb_url: cover.clone(),
+                    artist_id: Some("UCa".to_string()),
+                    album_id: Some("MPREb_1".to_string()),
+                }),
+            ]
+        );
+        let cards: Vec<(CardKind, &str)> = shelves[1]
+            .items
+            .iter()
+            .map(|item| match item {
+                ShelfItem::Card(card) => (card.kind, card.id.as_str()),
+                ShelfItem::Track(track) => panic!("unexpected song {}", track.id),
+            })
+            .collect();
+        assert_eq!(
+            cards,
+            [(CardKind::Album, "MPREb_2"), (CardKind::Playlist, "PLlist"), (CardKind::Artist, "UCx")]
+        );
+        let ShelfItem::Card(album) = &shelves[1].items[0] else { unreachable!() };
+        assert_eq!((album.title.as_str(), album.subtitle.as_str()), ("Album", "Band • 3.2M plays"));
+
+        // A continuation page: the same list under another key, here the last.
+        let mut last = list.clone();
+        last.as_object_mut().unwrap().remove("continuations");
+        let (shelves, next) = parse_feed(&json!({"continuationContents": {"sectionListContinuation": last}}));
+        assert_eq!((shelves.len(), next), (2, None));
+
+        assert_eq!(parse_feed(&json!({"error": {"code": 401}})), (Vec::new(), None));
     }
 
     #[tokio::test]

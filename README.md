@@ -12,9 +12,13 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 - Synced lyrics from LRCLIB (fallback: YouTube Music)
 - Home, Explore, search (songs, albums, artists, playlists), album, artist and
   playlist pages
+- Home shows YouTube Music's own shelves: Listen again, Your daily discover,
+  Albums for you, mixes and the rest, personal once you sign in
+- The playing song's music video, opened in mpv at the same position
 - Playback with queue, shuffle, repeat and prefetch of the next track
 - Mini player in the YouTube Music phone layout, for a small window on a
-  side screen; it switches to a one-row strip when the window is short
+  side screen, with a lyrics screen coloured after the cover; it switches to
+  a one-row strip when the window is short
 - Keeps playing when you close the window (see below)
 - Cover art cached on disk, so pages you have seen load instantly
 - Media keys and desktop integration through MPRIS
@@ -29,6 +33,8 @@ Unofficial: not affiliated with or endorsed by YouTube or Google.
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on `PATH`, kept up to date. It
   fetches the audio; recent versions also need a JavaScript runtime such as
   `deno`.
+- Optional: [`mpv`](https://mpv.io) on `PATH`, for the video button. Without
+  it the video opens in the browser.
 - Linux, optional: yt-dlp's `secretstorage` Python module
   (`python-secretstorage` on Arch, `python3-secretstorage` on Debian/Ubuntu
   and Fedora). Needed to sign in by importing cookies from a Chromium-based

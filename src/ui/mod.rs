@@ -5,7 +5,7 @@ pub mod pages;
 
 use std::time::Duration;
 use crate::audio::Repeat;
-use crate::backend::{Card, CardKind, Track};
+use crate::backend::{Card, CardKind, Shelf, ShelfItem, Track};
 use crate::App;
 
 pub use library::*;
@@ -38,6 +38,7 @@ fastframe_icons::icons! {
         RepeatOne => "repeat-1",
         Queue => "list-music",
         Lyrics => "mic-vocal",
+        Video => "video",
         Volume => lucide "volume-2",
         VolumeMute => lucide "volume-x",
         Plus => lucide "plus",
@@ -195,6 +196,8 @@ pub enum Action {
     ToggleQueue,
     ToggleLyrics,
     RetryLyrics,
+    /// Open the playing track's music video in a player window.
+    WatchVideo,
     Resume,
     Pause,
     SeekRelative(i64),
@@ -736,7 +739,42 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
         });
 }
 
-pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
+/// An icon at a fixed place, as a button: `rect` takes the click and a soft
+/// disc shows on hover. For bars laid out by hand (player bar, mini player).
+pub fn icon_button(ui: &mut egui::Ui, rect: egui::Rect, icon: Icon, color: egui::Color32, size: f32) -> egui::Response {
+    let resp = ui.interact(
+        rect,
+        ui.id().with(("icon-btn", rect.min.x as i32, rect.min.y as i32)),
+        egui::Sense::click(),
+    );
+    let lift = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    if lift > 0.0 {
+        ui.painter().circle_filled(
+            rect.center(),
+            rect.width().min(rect.height()) / 2.0,
+            egui::Color32::from_white_alpha((24.0 * lift) as u8),
+        );
+    }
+    icon.image(color, size).paint_at(ui, egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(size)));
+    resp
+}
+
+/// The player bar's three blocks. Lets the headless layout test assert the
+/// track stays between the other two.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // read by the layout test; production callers ignore it
+pub struct PlayerBarRects {
+    pub transport: egui::Rect,
+    pub track: egui::Rect,
+    pub tools: egui::Rect,
+}
+
+/// Width of the volume slider, which opens left of its icon on hover.
+const VOLUME_SLIDER_WIDTH: f32 = 72.0;
+
+/// The music.youtube.com player bar: the seek line along the top, transport
+/// and time on the left, the track centred, tools on the right.
+pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) -> PlayerBarRects {
     let accent = app
         .queue
         .current()
@@ -793,226 +831,190 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 );
             }
 
-            ui.horizontal_centered(|ui| {
-                ui.add_space(16.0);
+            // Everything below the seek line sits at fixed places on one row.
+            let row = ui.available_rect_before_wrap();
+            let mid = row.center().y;
+            let cell = |left: f32, size: f32| {
+                egui::Rect::from_min_size(egui::pos2(left, mid - size / 2.0), egui::Vec2::splat(size))
+            };
 
-                if ui
-                    .add(egui::Button::image(Icon::Prev.image(COLOR_TEXT_PRIMARY, 20.0)).frame(false))
-                    .clicked()
-                {
-                    actions.push(Action::PrevTrack);
-                }
+            // Left: previous, play/pause, next, time.
+            let prev = cell(row.left() + 12.0, 40.0);
+            let play = cell(prev.right() + 4.0, 48.0);
+            let next = cell(play.right() + 4.0, 40.0);
+            if icon_button(ui, prev, Icon::Prev, COLOR_TEXT_PRIMARY, 24.0).clicked() {
+                actions.push(Action::PrevTrack);
+            }
+            let play_icon = if app.player.is_paused() { Icon::Play } else { Icon::Pause };
+            if icon_button(ui, play, play_icon, COLOR_TEXT_PRIMARY, 34.0).clicked() {
+                actions.push(Action::TogglePlayPause);
+            }
+            if icon_button(ui, next, Icon::Next, COLOR_TEXT_PRIMARY, 24.0).clicked() {
+                actions.push(Action::NextTrack(true));
+            }
+            let time = ui.painter().text(
+                egui::pos2(next.right() + 8.0, mid),
+                egui::Align2::LEFT_CENTER,
+                format!("{} / {}", format_duration(preview_pos), format_duration(total_dur)),
+                egui::FontId::proportional(12.0),
+                COLOR_TEXT_SECONDARY,
+            );
+            let transport = egui::Rect::from_min_max(row.min, egui::pos2(time.right(), row.bottom()));
 
-                let is_paused = app.player.is_paused();
-                let play_icon = if is_paused {
-                    Icon::Play.image(COLOR_TEXT_PRIMARY, 20.0)
-                } else {
-                    Icon::Pause.image(COLOR_TEXT_PRIMARY, 20.0)
-                };
-                if ui
-                    .add_sized([36.0, 36.0], egui::Button::image(play_icon).frame(false))
-                    .clicked()
-                {
-                    actions.push(Action::TogglePlayPause);
-                }
+            // Right, from the edge inward: mini, queue, lyrics, video, shuffle, repeat, volume.
+            let mut right = row.right() - 12.0;
+            let mut tool = || {
+                right -= 34.0;
+                cell(right, 34.0)
+            };
+            let mini_tip = if cfg!(target_os = "macos") {
+                "Mini player (Cmd+Shift+M)"
+            } else {
+                "Mini player (Ctrl+M)"
+            };
+            if icon_button(ui, tool(), Icon::Mini, COLOR_TEXT_SECONDARY, 20.0)
+                .on_hover_text(mini_tip)
+                .clicked()
+            {
+                actions.push(Action::ToggleMini);
+            }
+            let queue_color = if app.queue_open { COLOR_ACCENT_RED } else { COLOR_TEXT_SECONDARY };
+            if icon_button(ui, tool(), Icon::Queue, queue_color, 20.0)
+                .on_hover_text(if app.queue_open { "Close queue" } else { "Open queue" })
+                .clicked()
+            {
+                actions.push(Action::ToggleQueue);
+            }
+            let lyrics_color = if app.lyrics_open { COLOR_ACCENT_RED } else { COLOR_TEXT_SECONDARY };
+            if icon_button(ui, tool(), Icon::Lyrics, lyrics_color, 20.0)
+                .on_hover_text("Lyrics")
+                .clicked()
+            {
+                actions.push(Action::ToggleLyrics);
+            }
+            if icon_button(ui, tool(), Icon::Video, COLOR_TEXT_SECONDARY, 20.0)
+                .on_hover_text("Watch the video")
+                .clicked()
+            {
+                actions.push(Action::WatchVideo);
+            }
+            let off = egui::Color32::from_rgb(0x88, 0x88, 0x88);
+            let shuf_color = if app.queue.shuffle { COLOR_ACCENT_RED } else { off };
+            if icon_button(ui, tool(), Icon::Shuffle, shuf_color, 20.0)
+                .on_hover_text(if app.queue.shuffle { "Shuffle on" } else { "Shuffle off" })
+                .clicked()
+            {
+                actions.push(Action::ToggleShuffle);
+            }
+            let (rep_icon, rep_color, rep_tip) = match app.queue.repeat {
+                Repeat::Off => (Icon::Repeat, off, "Repeat off"),
+                Repeat::All => (Icon::Repeat, COLOR_TEXT_PRIMARY, "Repeat all"),
+                Repeat::One => (Icon::RepeatOne, COLOR_ACCENT_RED, "Repeat one"),
+            };
+            if icon_button(ui, tool(), rep_icon, rep_color, 20.0)
+                .on_hover_text(rep_tip)
+                .clicked()
+            {
+                actions.push(Action::CycleRepeat);
+            }
 
-                if ui
-                    .add(egui::Button::image(Icon::Next.image(COLOR_TEXT_PRIMARY, 20.0)).frame(false))
-                    .clicked()
-                {
-                    actions.push(Action::NextTrack(true));
-                }
+            // Volume: only the icon, until the pointer is on it; then a white
+            // slider opens to its left (painted further down, on top).
+            let volume_cell = tool();
+            let volume = app.player.volume();
+            let slider = egui::Rect::from_min_size(
+                egui::pos2(volume_cell.left() - VOLUME_SLIDER_WIDTH - 4.0, mid - 10.0),
+                egui::vec2(VOLUME_SLIDER_WIDTH, 20.0),
+            );
+            let tools = egui::Rect::from_min_max(egui::pos2(volume_cell.left(), row.top()), row.max);
 
-                ui.add_space(8.0);
-                let time_str =
-                    format!("{} / {}", format_duration(preview_pos), format_duration(total_dur));
-                ui.label(
-                    egui::RichText::new(time_str)
-                        .color(COLOR_TEXT_SECONDARY)
-                        .size(12.0),
+            // Centre: cover, title and artist, centred on the bar while that
+            // fits between the two blocks, else in the space left.
+            let free = egui::Rect::from_min_max(
+                egui::pos2(transport.right() + 16.0, row.top()),
+                egui::pos2(tools.left() - 16.0, row.bottom()),
+            );
+            let half = (row.center().x - free.left()).min(free.right() - row.center().x);
+            let lane = if half >= 120.0 {
+                egui::Rect::from_center_size(row.center(), egui::vec2(2.0 * half, row.height()))
+            } else {
+                free
+            };
+            let error_color = egui::Color32::from_rgb(0xFF, 0x44, 0x44);
+            let line = |text: &str, size: f32, color: egui::Color32, max_width: f32| {
+                let mut job = egui::text::LayoutJob::simple_singleline(
+                    text.to_owned(),
+                    egui::FontId::proportional(size),
+                    color,
                 );
+                job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(0.0));
+                ui.painter().layout_job(job)
+            };
+            let track = if let Some(track) = cur_track {
+                let (meta, meta_color) = match app.player_error() {
+                    Some(err) => (err.to_string(), error_color),
+                    None if app.is_loading => ("Loading…".to_string(), COLOR_TEXT_SECONDARY),
+                    None if track.album.is_empty() => (track.artist.clone(), COLOR_TEXT_SECONDARY),
+                    None => (format!("{} • {}", track.artist, track.album), COLOR_TEXT_SECONDARY),
+                };
+                // 40 px cover and a 12 px gap, then the two lines.
+                let title = line(&track.title, 15.0, COLOR_TEXT_PRIMARY, lane.width() - 52.0);
+                let meta = line(&meta, 13.0, meta_color, lane.width() - 52.0);
+                let width = 52.0 + title.size().x.max(meta.size().x);
+                let block = egui::Rect::from_center_size(lane.center(), egui::vec2(width, 40.0));
+                let cover = egui::Rect::from_min_size(block.min, egui::Vec2::splat(40.0));
+                ui.painter().rect_filled(cover, egui::CornerRadius::same(4), egui::Color32::from_rgb(0x30, 0x30, 0x30));
+                if let Some(url) = &track.thumb_url {
+                    mini::paint_square(ui, url.clone(), cover, egui::CornerRadius::same(4));
+                }
+                let top = mid - (title.size().y + 2.0 + meta.size().y) / 2.0;
+                let meta_top = top + title.size().y + 2.0;
+                ui.painter().galley(egui::pos2(cover.right() + 12.0, top), title, COLOR_TEXT_PRIMARY);
+                ui.painter().galley(egui::pos2(cover.right() + 12.0, meta_top), meta, meta_color);
+                block
+            } else if let Some(err) = app.player_error() {
+                let text = line(err, 13.0, error_color, lane.width());
+                let rect = egui::Rect::from_center_size(lane.center(), text.size());
+                ui.painter().galley(rect.min, text, error_color);
+                rect
+            } else {
+                egui::Rect::from_center_size(lane.center(), egui::Vec2::ZERO)
+            };
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(16.0);
-
-                    // Right-to-left order on screen: volume, repeat, shuffle, lyrics, queue, mini.
-                    let mini_tip = if cfg!(target_os = "macos") {
-                        "Mini player (Cmd+Shift+M)"
-                    } else {
-                        "Mini player (Ctrl+M)"
-                    };
-                    if ui
-                        .add(egui::Button::image(Icon::Mini.image(COLOR_TEXT_SECONDARY, 18.0)).frame(false))
-                        .on_hover_text(mini_tip)
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleMini);
-                    }
-                    ui.add_space(8.0);
-
-                    let queue_color = if app.queue_open {
-                        COLOR_ACCENT_RED
-                    } else {
-                        COLOR_TEXT_SECONDARY
-                    };
-                    if ui
-                        .add(egui::Button::image(Icon::Queue.image(queue_color, 18.0)).frame(false))
-                        .on_hover_text(if app.queue_open {
-                            "Close queue"
-                        } else {
-                            "Open queue"
-                        })
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleQueue);
-                    }
-                    ui.add_space(8.0);
-
-                    let lyrics_color = if app.lyrics_open {
-                        COLOR_ACCENT_RED
-                    } else {
-                        COLOR_TEXT_SECONDARY
-                    };
-                    if ui
-                        .add(egui::Button::image(Icon::Lyrics.image(lyrics_color, 18.0)).frame(false))
-                        .on_hover_text("Lyrics")
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleLyrics);
-                    }
-                    ui.add_space(8.0);
-
-                    let shuf_color = if app.queue.shuffle {
-                        COLOR_ACCENT_RED
-                    } else {
-                        egui::Color32::from_rgb(0x88, 0x88, 0x88)
-                    };
-                    let shuf_tip = if app.queue.shuffle { "Shuffle on" } else { "Shuffle off" };
-                    if ui
-                        .add(egui::Button::image(Icon::Shuffle.image(shuf_color, 16.0)).frame(false))
-                        .on_hover_text(shuf_tip)
-                        .clicked()
-                    {
-                        actions.push(Action::ToggleShuffle);
-                    }
-                    ui.add_space(8.0);
-
-                    let (rep_icon, rep_color, rep_tip) = match app.queue.repeat {
-                        Repeat::Off => (
-                            Icon::Repeat,
-                            egui::Color32::from_rgb(0x88, 0x88, 0x88),
-                            "Repeat off",
-                        ),
-                        Repeat::All => (Icon::Repeat, COLOR_TEXT_PRIMARY, "Repeat all"),
-                        Repeat::One => (Icon::RepeatOne, COLOR_ACCENT_RED, "Repeat one"),
-                    };
-                    if ui
-                        .add(egui::Button::image(rep_icon.image(rep_color, 16.0)).frame(false))
-                        .on_hover_text(rep_tip)
-                        .clicked()
-                    {
-                        actions.push(Action::CycleRepeat);
-                    }
-                    ui.add_space(8.0);
-
-                    let mut vol = app.player.volume();
-                    if ui
-                        .add_sized(
-                            [70.0, 16.0],
-                            egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false),
-                        )
-                        .changed()
-                    {
-                        actions.push(Action::SetVolume(vol));
-                    }
-
-                    let vol_icon = if vol > 0.0 {
-                        Icon::Volume.image(COLOR_TEXT_SECONDARY, 16.0)
-                    } else {
-                        Icon::VolumeMute.image(COLOR_TEXT_SECONDARY, 16.0)
-                    };
-                    ui.add(vol_icon);
-                    ui.add_space(16.0);
-
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        if let Some(track) = cur_track {
-                            if let Some(url) = &track.thumb_url {
-                                ui.add(
-                                    egui::Image::from_uri(url)
-                                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                                        .corner_radius(4),
-                                );
-                            } else {
-                                let (thumb_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(40.0, 40.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    thumb_rect,
-                                    egui::CornerRadius::same(4),
-                                    egui::Color32::from_rgb(0x30, 0x30, 0x30),
-                                );
-                            }
-                            ui.add_space(8.0);
-                            ui.vertical(|ui| {
-                                ui.set_max_width(ui.available_width().max(0.0));
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&track.title)
-                                                .color(COLOR_TEXT_PRIMARY)
-                                                .strong()
-                                                .size(13.0),
-                                        )
-                                        .truncate(),
-                                    );
-                                    if app.is_loading {
-                                        ui.label(
-                                            egui::RichText::new("Loading…")
-                                                .color(egui::Color32::from_rgb(0xFF, 0x88, 0x88))
-                                                .size(11.0),
-                                        );
-                                    }
-                                });
-                                if let Some(err) = app.player_error() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(err)
-                                                .color(egui::Color32::from_rgb(0xFF, 0x44, 0x44))
-                                                .size(11.0),
-                                        )
-                                        .truncate(),
-                                    );
-                                } else {
-                                    let meta = if track.album.is_empty() {
-                                        track.artist.clone()
-                                    } else {
-                                        format!("{} • {}", track.artist, track.album)
-                                    };
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(meta)
-                                                .color(COLOR_TEXT_SECONDARY)
-                                                .size(11.0),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            });
-                        } else if let Some(err) = app.player_error() {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(err)
-                                        .color(egui::Color32::from_rgb(0xFF, 0x44, 0x44))
-                                        .size(11.0),
-                                )
-                                .truncate(),
-                            );
-                        }
-                    });
-                });
-            });
-        });
+            let open_id = ui.id().with("volume-open");
+            let was_open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+            // Opens from the icon, then stays while the pointer is on either.
+            let mut open = ui.rect_contains_pointer(volume_cell)
+                || (was_open && ui.rect_contains_pointer(slider.union(volume_cell).expand(6.0)));
+            if was_open {
+                // Drawn last, over whatever the track's text put there.
+                ui.painter().rect_filled(slider.expand2(egui::vec2(10.0, 8.0)), egui::CornerRadius::same(4), fill);
+                let resp = ui.interact(slider, ui.id().with("volume"), egui::Sense::click_and_drag());
+                if (resp.dragged() || resp.clicked())
+                    && let Some(pointer) = resp.interact_pointer_pos()
+                {
+                    actions.push(Action::SetVolume(((pointer.x - slider.left()) / slider.width()).clamp(0.0, 1.0)));
+                }
+                open |= resp.dragged();
+                let rail = egui::Rect::from_center_size(slider.center(), egui::vec2(slider.width(), 3.0));
+                let level = egui::Rect::from_min_size(rail.min, egui::vec2(rail.width() * volume, rail.height()));
+                let painter = ui.painter();
+                painter.rect_filled(rail, egui::CornerRadius::same(2), egui::Color32::from_white_alpha(60));
+                painter.rect_filled(level, egui::CornerRadius::same(2), COLOR_TEXT_PRIMARY);
+                painter.circle_filled(egui::pos2(level.right(), rail.center().y), 6.0, COLOR_TEXT_PRIMARY);
+            }
+            if open != was_open {
+                ui.data_mut(|d| d.insert_temp(open_id, open));
+                ui.ctx().request_repaint();
+            }
+            let volume_icon = if volume > 0.0 { Icon::Volume } else { Icon::VolumeMute };
+            let volume_color = if open { COLOR_TEXT_PRIMARY } else { COLOR_TEXT_SECONDARY };
+            volume_icon
+                .image(volume_color, 20.0)
+                .paint_at(ui, egui::Rect::from_center_size(volume_cell.center(), egui::Vec2::splat(20.0)));
+            PlayerBarRects { transport, track, tools }
+        })
+        .inner
 }
 
 /// Right "Up next" panel: queue in play order, current highlighted, click
@@ -1164,9 +1166,11 @@ fn draw_queue_row_body(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     ui.add_space(8.0);
+                    // Home feed songs come without a length.
+                    let duration = if track.duration_secs > 0 { format_secs(track.duration_secs) } else { String::new() };
                     duration_rect = ui
                         .label(
-                            egui::RichText::new(format_secs(track.duration_secs))
+                            egui::RichText::new(duration)
                                 .color(COLOR_TEXT_SECONDARY)
                                 .size(12.0),
                         )
@@ -1301,6 +1305,95 @@ pub fn draw_shelf(
             ui.horizontal(|ui| {
                 for card in cards {
                     draw_card(ui, card, actions);
+                    ui.add_space(16.0);
+                }
+            });
+        });
+}
+
+/// A song as a card, the size of `draw_card`. Returns whether it was
+/// clicked: the caller knows which list it plays from.
+pub fn draw_track_card(
+    ui: &mut egui::Ui,
+    track: &Track,
+    current_id: Option<&str>,
+    actions: &mut Vec<Action>,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(160.0, 224.0), egui::Sense::click());
+    hover_prefetch(ui, &resp, track, actions);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect.expand(4.0), egui::CornerRadius::same(8), COLOR_SURFACE);
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.vertical(|ui| {
+            let art = egui::Rect::from_min_size(rect.min, egui::vec2(160.0, 160.0));
+            if let Some(url) = &track.thumb_url {
+                ui.put(
+                    art,
+                    egui::Image::from_uri(url)
+                        .fit_to_exact_size(egui::vec2(160.0, 160.0))
+                        .corner_radius(4),
+                );
+            } else {
+                ui.painter().rect_filled(art, egui::CornerRadius::same(4), egui::Color32::from_rgb(0x30, 0x30, 0x30));
+                ui.allocate_rect(art, egui::Sense::hover());
+            }
+            // The play mark tells a song from an album before the click.
+            if resp.hovered() {
+                ui.painter().rect_filled(art, egui::CornerRadius::same(4), egui::Color32::from_black_alpha(110));
+                Icon::Play
+                    .image(COLOR_TEXT_PRIMARY, 36.0)
+                    .paint_at(ui, egui::Rect::from_center_size(art.center(), egui::Vec2::splat(36.0)));
+            }
+            ui.add_space(8.0);
+            let title_col = if current_id == Some(track.id.as_str()) {
+                COLOR_ACCENT_RED
+            } else {
+                COLOR_TEXT_PRIMARY
+            };
+            ui.add(egui::Label::new(egui::RichText::new(&track.title).color(title_col).strong().size(14.0)).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(&track.artist).color(COLOR_TEXT_SECONDARY).size(12.0)).truncate());
+        });
+    });
+    resp.clicked()
+}
+
+/// One shelf of YouTube Music's home feed. A song plays, queued with the
+/// shelf's other songs; a card opens its page.
+pub fn draw_feed_shelf(ui: &mut egui::Ui, app: &App, shelf: &Shelf, index: usize, actions: &mut Vec<Action>) {
+    ui.add_space(16.0);
+    ui.label(
+        egui::RichText::new(&shelf.title)
+            .color(COLOR_TEXT_PRIMARY)
+            .strong()
+            .size(24.0),
+    );
+    ui.add_space(12.0);
+
+    let current_id = app.queue.current().map(|t| t.id.as_str());
+    egui::ScrollArea::horizontal()
+        .id_salt(("home_feed", index))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for item in &shelf.items {
+                    match item {
+                        ShelfItem::Card(card) => draw_card(ui, card, actions),
+                        ShelfItem::Track(track) => {
+                            if draw_track_card(ui, track, current_id, actions) {
+                                let tracks: Vec<Track> = shelf
+                                    .items
+                                    .iter()
+                                    .filter_map(|item| match item {
+                                        ShelfItem::Track(track) => Some(track.clone()),
+                                        ShelfItem::Card(_) => None,
+                                    })
+                                    .collect();
+                                let start = tracks.iter().position(|t| t.id == track.id).unwrap_or(0);
+                                actions.push(Action::PlayList { tracks, start, shuffle: None });
+                            }
+                        }
+                    }
                     ui.add_space(16.0);
                 }
             });
@@ -1724,6 +1817,55 @@ mod tests {
         }
         // Queue panel rows share the same geometry contract at panel width.
         assert_title_visible(queue_row_rects_at(360.0), 360.0, "queue");
+    }
+
+    /// Lay the player bar out headlessly at `width`, playing a track titled `title`.
+    fn player_bar_rects_at(width: f32, title: &str) -> PlayerBarRects {
+        let ctx = egui::Context::default();
+        let mut app = App::new(crate::Repaint::default());
+        app.queue = crate::audio::Queue::new(
+            vec![Track {
+                id: "t1".to_string(),
+                title: title.to_string(),
+                artist: "Some Artist".to_string(),
+                album: "Some Album".to_string(),
+                duration_secs: 245,
+                thumb_url: None,
+                artist_id: None,
+                album_id: None,
+            }],
+            0,
+        );
+        let mut out = None;
+        for _ in 0..2 {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 600.0))),
+                    ..Default::default()
+                },
+                |ui| out = Some(draw_player_bar(ui, &app, &mut Vec::new())),
+            )
+            .drop_without_applying_deltas();
+        }
+        out.unwrap()
+    }
+
+    #[test]
+    fn test_player_bar_track_is_centred_and_clear_of_the_buttons() {
+        let long = "A very long track title that must truncate instead of running under the buttons";
+        for (width, title) in [(800.0, long), (1200.0, long), (1200.0, "Short"), (2000.0, long)] {
+            let r = player_bar_rects_at(width, title);
+            assert!(r.track.width() > 100.0, "track block too narrow at {width}: {:?}", r.track);
+            assert!(
+                r.transport.right() < r.track.left() && r.track.right() < r.tools.left(),
+                "track block overlaps a neighbour at {width}: {r:?}"
+            );
+        }
+        // With room to spare the track sits in the middle of the bar, not of the gap.
+        for title in [long, "Short"] {
+            let r = player_bar_rects_at(1200.0, title);
+            assert!((r.track.center().x - 600.0).abs() < 1.0, "not centred: {:?}", r.track);
+        }
     }
 
     #[test]

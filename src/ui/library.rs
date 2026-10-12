@@ -138,7 +138,8 @@ pub fn draw_sign_in_dialog(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<A
     }
 }
 
-/// "Listen again" (history) + "Your playlists" shelves, drawn BEFORE Top songs.
+/// "Listen again" (history) + "Your playlists" shelves, drawn BEFORE Top songs
+/// when the home feed has nothing to show.
 pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     let Some(lib) = &app.library else { return };
     if lib.history.is_empty() && lib.playlists.is_empty() {
@@ -159,73 +160,13 @@ pub fn draw_home_library_shelves(ui: &mut egui::Ui, app: &App, actions: &mut Vec
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (idx, track) in lib.history.iter().take(20).enumerate() {
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(160.0, 210.0),
-                            egui::Sense::click(),
-                        );
-                        super::hover_prefetch(ui, &resp, track, actions);
-                        if resp.hovered() {
-                            ui.painter().rect_filled(
-                                rect.expand(4.0),
-                                egui::CornerRadius::same(8),
-                                COLOR_SURFACE,
-                            );
-                        }
-                        if resp.clicked() {
+                        if super::draw_track_card(ui, track, current_id, actions) {
                             actions.push(Action::PlayList {
                                 tracks: lib.history.clone(),
                                 start: idx,
                                 shuffle: None,
                             });
                         }
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                            ui.vertical(|ui| {
-                                let art = egui::Rect::from_min_size(
-                                    rect.min,
-                                    egui::vec2(160.0, 160.0),
-                                );
-                                if let Some(url) = &track.thumb_url {
-                                    ui.put(
-                                        art,
-                                        egui::Image::from_uri(url)
-                                            .fit_to_exact_size(egui::vec2(160.0, 160.0))
-                                            .corner_radius(4),
-                                    );
-                                } else {
-                                    ui.painter().rect_filled(
-                                        art,
-                                        egui::CornerRadius::same(4),
-                                        egui::Color32::from_rgb(0x30, 0x30, 0x30),
-                                    );
-                                    ui.allocate_rect(art, egui::Sense::hover());
-                                }
-                                ui.add_space(8.0);
-                                let title_col = if current_id == Some(track.id.as_str()) {
-                                    super::COLOR_ACCENT_RED
-                                } else {
-                                    COLOR_TEXT_PRIMARY
-                                };
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&track.title)
-                                            .color(title_col)
-                                            .strong()
-                                            .size(14.0),
-                                    )
-                                    .truncate()
-                                    .selectable(false),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&track.artist)
-                                            .color(COLOR_TEXT_SECONDARY)
-                                            .size(12.0),
-                                    )
-                                    .truncate()
-                                    .selectable(false),
-                                );
-                            });
-                        });
                         ui.add_space(16.0);
                     }
                 });
