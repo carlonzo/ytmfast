@@ -1168,8 +1168,8 @@ impl App {
     }
 
     /// Close button: quit when nothing plays, otherwise keep the music going.
-    /// macOS minimizes to the Dock; Linux closes the window and keeps
-    /// running behind the tray icon (see `main`).
+    /// Linux closes the window and keeps running behind the tray icon (see
+    /// `main`); macOS hides the app instead.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested())
             || self.quit_requested
@@ -1179,9 +1179,11 @@ impl App {
         }
         if cfg!(target_os = "linux") {
             self.background = true;
-        } else if cfg!(target_os = "macos") {
+        }
+        #[cfg(target_os = "macos")]
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            hide_app();
         }
     }
 
@@ -1250,6 +1252,11 @@ impl eframe::App for Window<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Hidden on macOS: nothing to draw. `logic` still runs.
+        #[cfg(target_os = "macos")]
+        if app_hidden() {
+            return;
+        }
         let app = &mut *self.app;
         let ctx = ui.ctx().clone();
         let mut actions = Vec::new();
@@ -1366,6 +1373,27 @@ fn add_homebrew_paths() {
     let path = with_extra_paths(&path, &["/opt/homebrew/bin", "/usr/local/bin"]);
     // SAFETY: called first in main, before any other thread exists.
     unsafe { std::env::set_var("PATH", path) };
+}
+
+/// Hide the whole app, as Cmd+H does: the window leaves the screen, and a
+/// Dock click or Cmd+Tab shows it again. Minimizing would freeze the UI on
+/// restore: egui-winit reads the minimized state only at startup on macOS,
+/// so a `Minimized(true)` we sent is never cleared.
+// ponytail: hides the app, not just the window (one window, so the same to the user). Window-only hide needs a custom NSApplicationDelegate for reopen, see winit's platform/macos.rs docs.
+#[cfg(target_os = "macos")]
+fn hide_app() {
+    if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+        objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+    }
+}
+
+/// Whether the app is hidden (`hide_app`, or Cmd+H): nothing is on screen.
+#[cfg(target_os = "macos")]
+fn app_hidden() -> bool {
+    objc2_foundation::MainThreadMarker::new().is_some_and(|mtm| {
+        // SAFETY: a read-only property, on the main thread.
+        unsafe { objc2_app_kit::NSApplication::sharedApplication(mtm).isHidden() }
+    })
 }
 
 /// Contents of the launcher entry pointing at `exe`. `Exec` is quoted per

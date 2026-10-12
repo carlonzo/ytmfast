@@ -22,3 +22,8 @@ semver = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["tokio", "blocking"] }
+
+# Hiding the app on the close button (`hide_app` in main.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2", default-features = false, features = ["NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.2", default-features = false, features = ["NSThread"] }
