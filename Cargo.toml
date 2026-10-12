@@ -26,4 +26,4 @@ ksni = { version = "0.3", default-features = false, features = ["tokio", "blocki
 # Hiding the app on the close button (`hide_app` in main.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
-objc2-foundation = { version = "0.2", default-features = false, features = ["NSThread"] }
+objc2 = "0.6"
