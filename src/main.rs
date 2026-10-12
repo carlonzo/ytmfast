@@ -1458,7 +1458,7 @@ fn add_homebrew_paths() {
 // ponytail: hides the app, not just the window (one window, so the same to the user). Window-only hide needs a custom NSApplicationDelegate for reopen, see winit's platform/macos.rs docs.
 #[cfg(target_os = "macos")]
 fn hide_app() {
-    if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
         objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
     }
 }
@@ -1466,10 +1466,8 @@ fn hide_app() {
 /// Whether the app is hidden (`hide_app`, or Cmd+H): nothing is on screen.
 #[cfg(target_os = "macos")]
 fn app_hidden() -> bool {
-    objc2_foundation::MainThreadMarker::new().is_some_and(|mtm| {
-        // SAFETY: a read-only property, on the main thread.
-        unsafe { objc2_app_kit::NSApplication::sharedApplication(mtm).isHidden() }
-    })
+    objc2::MainThreadMarker::new()
+        .is_some_and(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isHidden())
 }
 
 /// Contents of the launcher entry pointing at `exe`. `Exec` is quoted per
