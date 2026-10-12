@@ -431,15 +431,22 @@ fn default_device_id() -> Option<rodio::cpal::DeviceId> {
     rodio::cpal::default_host().default_output_device()?.id().ok()
 }
 
+fn is_device_lost_error(err: &rodio::cpal::Error) -> bool {
+    use rodio::cpal::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::DeviceNotAvailable | ErrorKind::StreamInvalidated
+    )
+}
+
 /// Opens the default output. `lost` is set from the audio thread when the
 /// system reports that the device is gone or the stream must be rebuilt.
 fn open_output(lost: Arc<AtomicBool>) -> Result<rodio::MixerDeviceSink, rodio::DeviceSinkError> {
-    use rodio::cpal::StreamError;
     rodio::DeviceSinkBuilder::from_default_device()
         .and_then(|b| {
             b.with_error_callback(move |e| {
                 eprintln!("audio stream error: {e}");
-                if matches!(e, StreamError::DeviceNotAvailable | StreamError::StreamInvalidated) {
+                if is_device_lost_error(&e) {
                     lost.store(true, Ordering::Relaxed);
                 }
             })
@@ -1037,5 +1044,26 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&a1, &a2));
         let b = fetch_lock("e9Qw4w9WgXcQ");
         assert!(!std::sync::Arc::ptr_eq(&a1, &b));
+    }
+
+    #[test]
+    fn test_is_device_lost_error() {
+        use rodio::cpal::{Error, ErrorKind};
+
+        assert!(is_device_lost_error(&Error::new(
+            ErrorKind::DeviceNotAvailable
+        )));
+        assert!(is_device_lost_error(&Error::new(
+            ErrorKind::StreamInvalidated
+        )));
+
+        assert!(!is_device_lost_error(&Error::new(ErrorKind::DeviceBusy)));
+        assert!(!is_device_lost_error(&Error::new(ErrorKind::DeviceChanged)));
+        assert!(!is_device_lost_error(&Error::new(
+            ErrorKind::HostUnavailable
+        )));
+        assert!(!is_device_lost_error(&Error::new(ErrorKind::Xrun)));
+        assert!(!is_device_lost_error(&Error::new(ErrorKind::BackendError)));
+        assert!(!is_device_lost_error(&Error::new(ErrorKind::Other)));
     }
 }
