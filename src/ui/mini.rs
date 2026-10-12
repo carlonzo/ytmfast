@@ -1,12 +1,13 @@
 //! Mini player: the YouTube Music phone layout in a small window. Tall
-//! windows stack cover, title, seek bar and controls; short ones (a strip on
-//! a side screen) put the cover beside them.
+//! windows stack cover, title, seek bar and controls, and can show the
+//! lyrics in place of the cover; short ones (a strip on a side screen) put
+//! the cover beside them.
 
 use std::time::Duration;
 
 use egui::{Align2, Color32, CornerRadius, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
-use super::{Action, COLOR_BG, Icon, eased_tint, format_duration, seek_interaction};
+use super::{Action, COLOR_BG, Icon, eased_tint, format_duration, icon_button, seek_interaction};
 use crate::{App, audio::Repeat, images};
 
 const PAD: f32 = 16.0;
@@ -22,6 +23,11 @@ const TALL_CHROME: f32 = 2.0 * PAD + TOP + AFTER_ART;
 const MIN_TALL_ART: f32 = 120.0;
 /// How much of the cover's colour the background takes.
 const BG_TINT: f32 = 0.38;
+/// The same behind the lyrics, where the colour fills the window.
+const LYRICS_BG_TINT: f32 = 0.85;
+/// How light the lyrics background is (linear intensity): white text keeps a
+/// contrast of about 7:1 on it.
+const LYRICS_BG_LIGHT: f32 = 0.10;
 
 pub fn draw_mini_player(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     egui::CentralPanel::default()
@@ -33,11 +39,17 @@ pub fn draw_mini_player(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
             let accent = track
                 .and_then(|t| t.thumb_url.as_deref())
                 .and_then(|url| images::shared().accent(&ctx, url));
-            let top = eased_tint(&ctx, "mini-tint", COLOR_BG, accent, BG_TINT);
+            let art = (rect.width() - 2.0 * PAD).min(rect.height() - TALL_CHROME);
+            let tall_layout = art >= MIN_TALL_ART;
+            let (accent, tint) = if tall_layout && app.lyrics_open {
+                (accent.map(lyrics_backdrop), LYRICS_BG_TINT)
+            } else {
+                (accent, BG_TINT)
+            };
+            let top = eased_tint(&ctx, "mini-tint", COLOR_BG, accent, tint);
             paint_gradient(ui.painter(), rect, top, top.lerp_to_gamma(COLOR_BG, 0.6));
 
-            let art = (rect.width() - 2.0 * PAD).min(rect.height() - TALL_CHROME);
-            if art >= MIN_TALL_ART {
+            if tall_layout {
                 tall(ui, app, rect, art, actions);
             } else {
                 strip(ui, app, rect, actions);
@@ -50,15 +62,38 @@ fn tall(ui: &mut egui::Ui, app: &App, rect: Rect, art: f32, actions: &mut Vec<Ac
     let inner = rect.shrink(PAD);
     let mut y = inner.top();
 
-    window_buttons(ui, app, Rect::from_min_size(inner.min, vec2(inner.width(), 28.0)), actions);
+    let buttons = Rect::from_min_size(inner.min, vec2(inner.width(), 28.0));
+    window_buttons(ui, app, buttons, actions);
+    // Between them, as on the phone: lyrics in place of the cover, and the video.
+    let lyrics_button = Rect::from_center_size(buttons.center() - vec2(16.0, 0.0), Vec2::splat(28.0));
+    let video_button = Rect::from_center_size(buttons.center() + vec2(16.0, 0.0), Vec2::splat(28.0));
+    if icon_button(ui, video_button, Icon::Video, WHITE, 16.0).on_hover_text("Watch the video").clicked() {
+        actions.push(Action::WatchVideo);
+    }
+    let lyrics_color = if app.lyrics_open { WHITE } else { DIM };
+    if icon_button(ui, lyrics_button, Icon::Lyrics, lyrics_color, 16.0)
+        .on_hover_text(if app.lyrics_open { "Show the cover" } else { "Show the lyrics" })
+        .clicked()
+    {
+        actions.push(Action::ToggleLyrics);
+    }
     y += TOP;
 
-    // The cover sits in the space left over, centred.
     let free = inner.bottom() - AFTER_ART - y;
-    let art_top = y + ((free - art) / 2.0).max(0.0);
-    let art_rect = Rect::from_center_size(pos2(inner.center().x, art_top + art / 2.0), Vec2::splat(art));
-    cover(ui, app, art_rect, 10.0);
-    y = art_rect.bottom() + 20.0;
+    if app.lyrics_open {
+        // The lyrics take all of the space left over.
+        let lines = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), free));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(lines), |ui| {
+            super::lyrics::draw_lyrics_body(ui, app, actions);
+        });
+        y = lines.bottom() + 20.0;
+    } else {
+        // The cover sits in it, centred.
+        let art_top = y + ((free - art) / 2.0).max(0.0);
+        let art_rect = Rect::from_center_size(pos2(inner.center().x, art_top + art / 2.0), Vec2::splat(art));
+        cover(ui, app, art_rect, 10.0);
+        y = art_rect.bottom() + 20.0;
+    }
 
     titles(ui, app, Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 48.0)), 20.0);
     y += 60.0;
@@ -153,7 +188,7 @@ fn cover(ui: &mut egui::Ui, app: &App, rect: Rect, radius: f32) {
 
 /// Paint `uri` into the square `rect`, cropping the middle of a wide video
 /// thumbnail instead of squashing it.
-fn paint_square(ui: &egui::Ui, uri: String, rect: Rect, corner: CornerRadius) {
+pub(super) fn paint_square(ui: &egui::Ui, uri: String, rect: Rect, corner: CornerRadius) {
     let image = egui::Image::from_uri(uri)
         .corner_radius(corner)
         .show_loading_spinner(false);
@@ -309,14 +344,13 @@ fn play_button(ui: &mut egui::Ui, app: &App, rect: Rect, icon: f32, actions: &mu
     }
 }
 
-fn icon_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, color: Color32, size: f32) -> egui::Response {
-    let resp = ui.interact(rect, ui.id().with(("mini-btn", rect.min.x as i32, rect.min.y as i32)), Sense::click());
-    let lift = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    if lift > 0.0 {
-        ui.painter().circle_filled(rect.center(), rect.width().min(rect.height()) / 2.0, Color32::from_white_alpha((24.0 * lift) as u8));
-    }
-    icon.image(color, size).paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(size)));
-    resp
+/// The cover's `color` at the one lightness white text reads well on: a
+/// light cover is darkened, a dark one lifted (up to 4x), the hue kept.
+fn lyrics_backdrop(color: Color32) -> Color32 {
+    let linear = egui::Rgba::from(color);
+    let scale = (LYRICS_BG_LIGHT / linear.intensity()).min(4.0);
+    let channel = |value: f32| (value * scale).min(1.0);
+    egui::Rgba::from_rgb(channel(linear.r()), channel(linear.g()), channel(linear.b())).into()
 }
 
 /// Top-to-bottom gradient over `rect`.
@@ -401,6 +435,38 @@ mod tests {
             actions.iter().any(|a| matches!(a, Action::TogglePlayPause)),
             "no play/pause at the disc: {actions:?}"
         );
+    }
+
+    #[test]
+    fn tall_layout_lyrics_and_video_buttons_sit_top_centre() {
+        let size = vec2(340.0, 560.0);
+        let actions = click_at(size, pos2(154.0, 30.0));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::ToggleLyrics)),
+            "no ToggleLyrics at the lyrics button: {actions:?}"
+        );
+        let actions = click_at(size, pos2(186.0, 30.0));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::WatchVideo)),
+            "no WatchVideo at the video button: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn lyrics_background_is_dark_under_any_cover() {
+        let light = |color: Color32| egui::Rgba::from(color).intensity();
+        for cover in [Color32::WHITE, Color32::from_rgb(255, 230, 0), Color32::from_rgb(120, 200, 255)] {
+            let bg = lyrics_backdrop(cover);
+            assert!(light(bg) <= LYRICS_BG_LIGHT + 0.01, "{cover:?} stays too light: {bg:?}");
+        }
+        // The hue survives: yellow stays an equal mix of red and green, with no blue.
+        let [r, g, b, _] = lyrics_backdrop(Color32::from_rgb(255, 255, 0)).to_array();
+        assert!(r == g && r > 60 && b == 0, "({r}, {g}, {b})");
+        // A dark cover is lifted so its colour shows, never past the limit.
+        let navy = Color32::from_rgb(10, 20, 60);
+        let lifted = lyrics_backdrop(navy);
+        assert!(light(lifted) > light(navy) && light(lifted) <= LYRICS_BG_LIGHT + 0.01, "{lifted:?}");
+        assert_eq!(lyrics_backdrop(Color32::BLACK), Color32::BLACK);
     }
 
     #[test]

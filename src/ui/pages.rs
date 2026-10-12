@@ -1,7 +1,9 @@
 use super::*;
 
 pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
-    if app.home_loading {
+    // Wait for the feed's first page too: it goes on top, and arriving late
+    // it would push the page down under the pointer.
+    if app.home_loading || (app.feed_loading && app.feed.is_empty()) {
         ui.vertical_centered(|ui| {
             ui.add_space(100.0);
             ui.spinner();
@@ -31,8 +33,14 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
         return;
     };
 
-    // 0. Signed-in shelves first: Listen again + Your playlists.
-    if app.signed_in {
+    // 0. YouTube Music's own home shelves first (Listen again, Your daily
+    // discover, Albums for you, …); without them, the library's.
+    if !app.feed.is_empty() {
+        for (index, shelf) in app.feed.iter().enumerate() {
+            draw_feed_shelf(ui, app, shelf, index, actions);
+        }
+        ui.add_space(16.0);
+    } else if app.signed_in {
         draw_home_library_shelves(ui, app, actions);
     }
 
