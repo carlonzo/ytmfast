@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # "links" lets egui open the release page in a browser. eframe enables it by default; this file turns defaults off.
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit", "links"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit", "links"] }
 egui = "0.36"
 egui_extras = { version = "0.36", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
