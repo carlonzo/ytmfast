@@ -1548,8 +1548,8 @@ dependencies = [
 
 [[package]]
 name = "fastframe-icons"
-version = "0.13.0"
-source = "git+https://github.com/crmne/fastframe?tag=v0.13.0#d5e1a99702f39fda6e252b7acb5582c60becf545"
+version = "0.14.0"
+source = "git+https://github.com/crmne/fastframe?tag=v0.14.0#dfd2db7bc6a5ae0c62a98383c84235f64da2cace"
 dependencies = [
  "egui",
 ]
