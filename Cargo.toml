@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# "links" lets egui open the release page in a browser. eframe enables it by default; this file turns defaults off.
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit", "links"] }
-egui = "0.36"
-egui_extras = { version = "0.36", features = ["image", "svg"] }
+# eframe's defaults are off. "links" opens the release page in a browser.
+# "clipboard" shipped inside eframe 0.36 and is its own feature in 0.37; keep the OS clipboard.
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "persistence", "accesskit", "clipboard", "links"] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 rustypipe = { version = "0.11.4", features = ["rustls-tls-native-roots", "userdata"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "time"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4"] }
 directories = "6"
-fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.14.0" }
+fastframe-icons = { path = "vendor/fastframe-icons" }
 fastframe-now-playing = { git = "https://github.com/crmne/fastframe", tag = "v0.14.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

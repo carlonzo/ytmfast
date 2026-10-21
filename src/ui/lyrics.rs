@@ -98,7 +98,7 @@ pub fn draw_lyrics_body(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
     }
     let active =
         lyrics.active_line(app.player.position().as_millis().min(u32::MAX as u128) as u32);
-    let seen_id = ui.id().with("lyrics_seen");
+    let seen_id = ui.scope_id().with("lyrics_seen");
     let current = {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let mut h = DefaultHasher::new();
@@ -119,7 +119,7 @@ pub fn draw_lyrics_body(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                 // over LIGHT_UP_SECONDS instead of switching (spotifast).
                 let lit = if lyrics.synced {
                     ui.ctx().animate_bool_with_time(
-                        ui.id().with(("lyric-line", index)),
+                        ui.scope_id().with(("lyric-line", index)),
                         active == Some(index),
                         LIGHT_UP_SECONDS,
                     )

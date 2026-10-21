@@ -1,0 +1,25 @@
+# Vendored from https://github.com/crmne/fastframe tag v0.14.0
+# (dfd2db7bc6a5ae0c62a98383c84235f64da2cace).
+# Upstream v0.14.0 still depends on egui 0.36.2, and `install` / `Icon::image`
+# use that crate's types. This copy depends on egui 0.37 so it matches ytmfast.
+# Rust and SVG sources are the v0.14.0 tag unchanged. License: MIT AND ISC
+# (see LICENSE and icons/lucide/LICENSE.txt).
+
+[package]
+name = "fastframe-icons"
+description = "Embedded SVG icon sets for egui, with the Lucide icons the apps share"
+version = "0.14.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT AND ISC"
+authors = ["Carmine Paolino <carmine@paolino.me>"]
+repository = "https://github.com/crmne/fastframe"
+homepage = "https://github.com/crmne/fastframe"
+readme = "README.md"
+keywords = ["egui", "icons", "svg", "lucide"]
+categories = ["gui"]
+include = ["src", "icons", "tests", "README.md", "Cargo.toml", "LICENSE"]
+publish = false
+
+[dependencies]
+egui = { version = "0.37", default-features = false }

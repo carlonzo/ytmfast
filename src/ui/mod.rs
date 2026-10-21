@@ -246,7 +246,7 @@ pub fn eased_tint(
     let target = accent.map_or(base, |accent| base.lerp_to_gamma(accent, strength));
     let [r, g, b, _] = target.to_array();
     let channel = |axis: &'static str, value: u8| {
-        ctx.animate_value_with_time(egui::Id::new((salt, axis)), f32::from(value), TINT_FADE_SECONDS)
+        ctx.animate_value_with_time(egui::Id::unique((salt, axis)), f32::from(value), TINT_FADE_SECONDS)
             .round() as u8
     };
     egui::Color32::from_rgb(channel("r", r), channel("g", g), channel("b", b))
@@ -297,12 +297,12 @@ const PLAYING_ID: &str = "ytmfast-now-playing";
 /// Record once per frame whether music is audibly playing, for the
 /// now-playing bars drawn deep inside rows.
 pub fn set_playing(ctx: &egui::Context, playing: bool) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(PLAYING_ID), playing));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(PLAYING_ID), playing));
 }
 
 /// Three bouncing bars marking the playing track; still while paused.
 pub fn playing_bars(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-    let playing = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::new(PLAYING_ID))).unwrap_or(false);
+    let playing = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::unique(PLAYING_ID))).unwrap_or(false);
     let time = ui.input(|i| i.time) as f32;
     let bar_w = rect.width() / 5.0;
     for (i, (speed, phase)) in [(7.0, 0.0), (9.5, 1.7), (6.0, 3.1)].into_iter().enumerate() {
@@ -475,7 +475,7 @@ pub fn draw_top_bar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                             actions.push(Action::ToggleUserMenu);
                         }
                         if app.show_user_menu && !avatar_clicked {
-                            let menu_resp = egui::Area::new(egui::Id::new("user_menu"))
+                            let menu_resp = egui::Area::new(egui::Id::unique("user_menu"))
                                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 56.0))
                                 .show(ui.ctx(), |ui| {
                                     egui::Frame::new()
@@ -744,7 +744,7 @@ pub fn draw_left_sidebar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>
 pub fn icon_button(ui: &mut egui::Ui, rect: egui::Rect, icon: Icon, color: egui::Color32, size: f32) -> egui::Response {
     let resp = ui.interact(
         rect,
-        ui.id().with(("icon-btn", rect.min.x as i32, rect.min.y as i32)),
+        ui.scope_id().with(("icon-btn", rect.min.x as i32, rect.min.y as i32)),
         egui::Sense::click(),
     );
     let lift = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
@@ -981,7 +981,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
                 egui::Rect::from_center_size(lane.center(), egui::Vec2::ZERO)
             };
 
-            let open_id = ui.id().with("volume-open");
+            let open_id = ui.scope_id().with("volume-open");
             let was_open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
             // Opens from the icon, then stays while the pointer is on either.
             let mut open = ui.rect_contains_pointer(volume_cell)
@@ -989,7 +989,7 @@ pub fn draw_player_bar(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) 
             if was_open {
                 // Drawn last, over whatever the track's text put there.
                 ui.painter().rect_filled(slider.expand2(egui::vec2(10.0, 8.0)), egui::CornerRadius::same(4), fill);
-                let resp = ui.interact(slider, ui.id().with("volume"), egui::Sense::click_and_drag());
+                let resp = ui.interact(slider, ui.scope_id().with("volume"), egui::Sense::click_and_drag());
                 if (resp.dragged() || resp.clicked())
                     && let Some(pointer) = resp.interact_pointer_pos()
                 {
@@ -1073,11 +1073,11 @@ pub fn draw_queue_panel(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>)
                 }),
             );
             let seen: Option<(usize, Option<u64>)> =
-                ui.data_mut(|d| d.get_temp(ui.id().with("queue_seen")));
+                ui.data_mut(|d| d.get_temp(ui.scope_id().with("queue_seen")));
             let scroll_to_current = seen != Some(seen_key);
             if scroll_to_current {
                 ui.data_mut(|d| {
-                    d.insert_temp(ui.id().with("queue_seen"), seen_key);
+                    d.insert_temp(ui.scope_id().with("queue_seen"), seen_key);
                 });
             }
             let spacing_y = ui.spacing().item_spacing.y;
