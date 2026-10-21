@@ -4,5 +4,22 @@
     "config:recommended"
   ],
   "automerge": true,
-  "platformAutomerge": false
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "groupName": "egui",
+      "matchDatasources": ["crate"],
+      "matchPackageNames": [
+        "egui",
+        "eframe",
+        "egui_extras",
+        "egui-winit",
+        "egui_glow",
+        "egui-wgpu",
+        "epaint",
+        "emath",
+        "ecolor"
+      ]
+    }
+  ]
 }

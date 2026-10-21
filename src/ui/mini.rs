@@ -164,7 +164,7 @@ fn window_buttons(ui: &mut egui::Ui, app: &App, rect: Rect, actions: &mut Vec<Ac
 /// The cover, shrinking a little while paused (an eased "breath").
 fn cover(ui: &mut egui::Ui, app: &App, rect: Rect, radius: f32) {
     let playing = app.is_active_playback && !app.is_loading && !app.player.is_paused();
-    let t = ui.ctx().animate_bool_with_time(egui::Id::new("mini-cover-playing"), playing, 0.3);
+    let t = ui.ctx().animate_bool_with_time(egui::Id::unique("mini-cover-playing"), playing, 0.3);
     let rect = Rect::from_center_size(rect.center(), rect.size() * egui::lerp(0.9..=1.0, t));
     let corner = CornerRadius::same(radius as u8);
     ui.painter().rect_filled(rect, corner, Color32::from_white_alpha(14));
@@ -247,7 +247,7 @@ fn seek_bar(ui: &mut egui::Ui, app: &App, rect: Rect, with_times: bool, actions:
     });
     let pos = app.player.position();
     let bar = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(rect.width(), 12.0));
-    let resp = ui.interact(bar, ui.id().with("mini-seek"), Sense::click_and_drag());
+    let resp = ui.interact(bar, ui.scope_id().with("mini-seek"), Sense::click_and_drag());
     let (fraction, preview) = seek_interaction(ui, &resp, bar, pos, total, actions);
 
     let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.dragged(), 0.15);
@@ -322,7 +322,7 @@ enum Slot {
 }
 
 fn play_button(ui: &mut egui::Ui, app: &App, rect: Rect, icon: f32, actions: &mut Vec<Action>) {
-    let resp = ui.interact(rect, ui.id().with("mini-play"), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with("mini-play"), Sense::click());
     let grow = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     let radius = rect.width() / 2.0 * egui::lerp(0.94..=1.0, grow);
     ui.painter().circle(rect.center(), radius, WHITE, Stroke::NONE);
