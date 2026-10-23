@@ -106,12 +106,7 @@ pub fn draw_home(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                             );
                                         }
                                         if let Some(url) = &track.thumb_url {
-                                            ui.put(
-                                                thumb_rect,
-                                                egui::Image::from_uri(url)
-                                                    .fit_to_exact_size(egui::vec2(44.0, 44.0))
-                                                    .corner_radius(4),
-                                            );
+                                            put_cover(ui, url, thumb_rect, egui::CornerRadius::same(4));
                                         } else {
                                             ui.painter().rect_filled(
                                                 thumb_rect,
@@ -332,11 +327,11 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                     ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);
                         if let Some(url) = &artist_card.thumb_url {
-                            ui.add(
-                                egui::Image::from_uri(url)
-                                    .fit_to_exact_size(egui::vec2(96.0, 96.0))
-                                    .corner_radius(egui::CornerRadius::same(48)),
+                            let (art_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(96.0, 96.0),
+                                egui::Sense::hover(),
                             );
+                            put_cover(ui, url, art_rect, egui::CornerRadius::same(48));
                         } else {
                             let (art_rect, _) = ui.allocate_exact_size(
                                 egui::vec2(96.0, 96.0),
@@ -377,11 +372,11 @@ pub fn draw_search(ui: &mut egui::Ui, app: &App, query: &str, actions: &mut Vec<
                     ui.horizontal_centered(|ui| {
                         ui.add_space(12.0);
                         if let Some(url) = &track.thumb_url {
-                            ui.add(
-                                egui::Image::from_uri(url)
-                                    .fit_to_exact_size(egui::vec2(96.0, 96.0))
-                                    .corner_radius(4),
+                            let (art_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(96.0, 96.0),
+                                egui::Sense::hover(),
                             );
+                            put_cover(ui, url, art_rect, egui::CornerRadius::same(4));
                         } else {
                             let (art_rect, _) = ui.allocate_exact_size(
                                 egui::vec2(96.0, 96.0),
@@ -518,11 +513,11 @@ pub fn draw_collection(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec
     ui.horizontal(|ui| {
         let art_size = 264.0;
         if let Some(url) = &collection.thumb_url {
-            ui.add(
-                egui::Image::from_uri(url)
-                    .fit_to_exact_size(egui::vec2(art_size, art_size))
-                    .corner_radius(8),
+            let (art_rect, _) = ui.allocate_exact_size(
+                egui::vec2(art_size, art_size),
+                egui::Sense::hover(),
             );
+            put_cover(ui, url, art_rect, egui::CornerRadius::same(8));
         } else {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(art_size, art_size), egui::Sense::hover());
             ui.painter().rect_filled(
@@ -681,12 +676,7 @@ pub fn draw_artist(ui: &mut egui::Ui, app: &App, id: &str, actions: &mut Vec<Act
     );
 
     if let Some(url) = &artist.thumb_url {
-        ui.put(
-            header_rect,
-            egui::Image::from_uri(url)
-                .fit_to_exact_size(egui::vec2(banner_width, banner_height))
-                .corner_radius(8),
-        );
+        put_cover(ui, url, header_rect, egui::CornerRadius::same(8));
         // Gradient overlay
         ui.painter().rect_filled(
             header_rect,

@@ -6,7 +6,28 @@ pub mod pages;
 use std::time::Duration;
 use crate::audio::Repeat;
 use crate::backend::{Card, CardKind, Shelf, ShelfItem, Track};
+use crate::images;
 use crate::App;
+
+const COVER_PLACEHOLDER: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
+
+/// Draw a cover, or a flat placeholder when `rect` is outside the scroll
+/// viewport. Off-screen covers are not decoded, and ones that scroll away
+/// are dropped by [`images::evict_stale`].
+pub(crate) fn put_cover(ui: &mut egui::Ui, url: &str, rect: egui::Rect, corner: egui::CornerRadius) {
+    if !ui.clip_rect().expand(240.0).intersects(rect) {
+        ui.painter().rect_filled(rect, corner, COVER_PLACEHOLDER);
+        return;
+    }
+    let uri = images::cover_uri_for(url, rect.size(), ui.pixels_per_point());
+    images::touch(&uri);
+    ui.put(
+        rect,
+        egui::Image::from_uri(uri)
+            .fit_to_exact_size(rect.size())
+            .corner_radius(corner),
+    );
+}
 
 pub use library::*;
 pub use pages::*;
@@ -1130,12 +1151,9 @@ fn draw_queue_row_body(
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
             let thumb = if let Some(url) = &track.thumb_url {
-                ui.add(
-                    egui::Image::from_uri(url)
-                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                        .corner_radius(4),
-                )
-                .rect
+                let (r, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                put_cover(ui, url, r, egui::CornerRadius::same(4));
+                r
             } else {
                 let (r, _) =
                     ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
@@ -1246,12 +1264,7 @@ pub fn draw_card(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<Action>) {
             };
 
             if let Some(url) = &card.thumb_url {
-                ui.put(
-                    art_rect,
-                    egui::Image::from_uri(url)
-                        .fit_to_exact_size(egui::vec2(160.0, 160.0))
-                        .corner_radius(corner),
-                );
+                put_cover(ui, url, art_rect, corner);
             } else {
                 ui.allocate_rect(art_rect, egui::Sense::hover());
                 ui.painter().rect_filled(art_rect, corner, egui::Color32::from_rgb(0x30, 0x30, 0x30));
@@ -1328,12 +1341,7 @@ pub fn draw_track_card(
         ui.vertical(|ui| {
             let art = egui::Rect::from_min_size(rect.min, egui::vec2(160.0, 160.0));
             if let Some(url) = &track.thumb_url {
-                ui.put(
-                    art,
-                    egui::Image::from_uri(url)
-                        .fit_to_exact_size(egui::vec2(160.0, 160.0))
-                        .corner_radius(4),
-                );
+                put_cover(ui, url, art, egui::CornerRadius::same(4));
             } else {
                 ui.painter().rect_filled(art, egui::CornerRadius::same(4), egui::Color32::from_rgb(0x30, 0x30, 0x30));
                 ui.allocate_rect(art, egui::Sense::hover());
@@ -1539,12 +1547,7 @@ pub fn draw_track_row(
                     play_triggered = true;
                 }
                 if let Some(url) = &track.thumb_url {
-                    ui.put(
-                        thumb_rect,
-                        egui::Image::from_uri(url)
-                            .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                            .corner_radius(4),
-                    );
+                    put_cover(ui, url, thumb_rect, egui::CornerRadius::same(4));
                 } else {
                     ui.painter().rect_filled(
                         thumb_rect,

@@ -710,6 +710,8 @@ impl Backend {
 
         std::thread::spawn(move || {
             let (rt, rt_err) = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("ytmfast-net")
                 .enable_all()
                 .build()
             {
