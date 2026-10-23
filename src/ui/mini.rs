@@ -189,6 +189,11 @@ fn cover(ui: &mut egui::Ui, app: &App, rect: Rect, radius: f32) {
 /// Paint `uri` into the square `rect`, cropping the middle of a wide video
 /// thumbnail instead of squashing it.
 pub(super) fn paint_square(ui: &egui::Ui, uri: String, rect: Rect, corner: CornerRadius) {
+    if !ui.clip_rect().expand(240.0).intersects(rect) {
+        return;
+    }
+    let uri = crate::images::cover_uri_for(&uri, rect.size(), ui.pixels_per_point());
+    crate::images::touch(&uri);
     let image = egui::Image::from_uri(uri)
         .corner_radius(corner)
         .show_loading_spinner(false);

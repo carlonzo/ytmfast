@@ -1316,6 +1316,10 @@ struct Window<'a> {
 
 impl eframe::App for Window<'_> {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Drop the CPU copy of a cover once it is on the GPU. The saved
+        // options can say otherwise; this app never reads the pixels back.
+        ctx.options_mut(|o| o.reduce_texture_memory = true);
+        images::evict_stale(ctx);
         let app = &mut *self.app;
         app.tick(Some(ctx));
         app.handle_close_request(ctx);
@@ -1563,6 +1567,24 @@ fn main() -> eframe::Result {
     }
 }
 
+/// The PNG on disk is 1024² and eframe keeps the decoded pixels for the
+/// life of the window. 256² is the size the dock and the taskbar use.
+fn fit_icon(icon: egui::IconData) -> egui::IconData {
+    const SIDE: u32 = 256;
+    if icon.width <= SIDE && icon.height <= SIDE {
+        return icon;
+    }
+    let egui::IconData { rgba, width, height } = icon;
+    let Some(image) = image::RgbaImage::from_raw(width, height, rgba) else {
+        return egui::IconData { rgba: Vec::new(), width: 0, height: 0 };
+    };
+    let small = image::DynamicImage::ImageRgba8(image)
+        .resize(SIDE, SIDE, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let (width, height) = (small.width(), small.height());
+    egui::IconData { rgba: small.into_raw(), width, height }
+}
+
 /// Open the window and run it until it closes. The first window creates the
 /// `App` in `slot` (settings come from eframe's storage); later windows
 /// reuse it.
@@ -1575,7 +1597,7 @@ fn run_window(slot: &mut Option<App>) -> eframe::Result {
         // so a restored mini player window is not forced to full size.
         .with_min_inner_size(MINI_MIN);
     match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png")) {
-        Ok(icon) => viewport = viewport.with_icon(icon),
+        Ok(icon) => viewport = viewport.with_icon(fit_icon(icon)),
         Err(error) => eprintln!("Could not load app icon: {error}"),
     }
     let native_options = eframe::NativeOptions {
@@ -1595,6 +1617,8 @@ fn run_window(slot: &mut Option<App>) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // After egui_extras, so this loader is asked first and covers are
+            // decoded at the size on screen instead of the file's full size.
             images::install(&cc.egui_ctx);
             fastframe_icons::install::<ui::Icon>(&cc.egui_ctx);
             ui::apply_theme(&cc.egui_ctx);
@@ -1633,6 +1657,24 @@ fn create_app(cc: &eframe::CreationContext<'_>) -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_icon_is_capped_at_256() {
+        let big = egui::IconData {
+            rgba: vec![9u8; 300 * 300 * 4],
+            width: 300,
+            height: 300,
+        };
+        let small = fit_icon(big);
+        assert_eq!((small.width, small.height), (256, 256));
+        assert_eq!(small.rgba.len(), 256 * 256 * 4);
+        let already = egui::IconData {
+            rgba: vec![0u8; 64 * 64 * 4],
+            width: 64,
+            height: 64,
+        };
+        assert_eq!(fit_icon(already).width, 64);
+    }
 
     #[test]
     fn desktop_entry_quotes_exec() {
