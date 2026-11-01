@@ -1539,8 +1539,8 @@ dependencies = [
 
 [[package]]
 name = "fastframe-desktop"
-version = "0.15.3"
-source = "git+https://github.com/crmne/fastframe?tag=v0.15.3#a6a913933d89718f7e5880f0611b0504fa6a5d7d"
+version = "0.15.4"
+source = "git+https://github.com/crmne/fastframe?tag=v0.15.4#8faf6f99ba782b22916a118c77d1a25d97d1414f"
 dependencies = [
  "log",
  "mac-usernotifications",
@@ -1556,8 +1556,8 @@ dependencies = [
 
 [[package]]
 name = "fastframe-now-playing"
-version = "0.15.3"
-source = "git+https://github.com/crmne/fastframe?tag=v0.15.3#a6a913933d89718f7e5880f0611b0504fa6a5d7d"
+version = "0.15.4"
+source = "git+https://github.com/crmne/fastframe?tag=v0.15.4#8faf6f99ba782b22916a118c77d1a25d97d1414f"
 dependencies = [
  "fastframe-desktop",
  "log",
