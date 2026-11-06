@@ -316,14 +316,17 @@ pub fn has_cookies(filtered: &str) -> bool {
     })
 }
 
-/// True iff the jar holds a Google login cookie (`SAPISID` or its
-/// `__Secure-` variants). A jar without one cannot authenticate, which is
-/// what a browser import yields when cookie decryption failed.
+/// True iff the jar holds a YouTube login cookie (`SAPISID` or its
+/// `__Secure-` variants) on `.youtube.com`, the only domain rustypipe reads.
+/// A `.google.com`-only login (signed into Chrome, never into YouTube in that
+/// profile) or a failed decryption cannot authenticate.
 pub fn has_login_cookie(jar: &str) -> bool {
     jar.lines().any(|line| {
-        line.split('\t')
-            .nth(5)
-            .is_some_and(|name| name == "SAPISID" || name.ends_with("PAPISID"))
+        let mut cols = line.trim_start_matches("#HttpOnly_").split('\t');
+        cols.next() == Some(".youtube.com")
+            && cols
+                .nth(4)
+                .is_some_and(|name| name == "SAPISID" || name.ends_with("PAPISID"))
     })
 }
 
@@ -715,6 +718,7 @@ mod tests {
         assert!(!has_login_cookie(&line("VISITOR_INFO1_LIVE")));
         assert!(has_login_cookie(&line("SAPISID")));
         assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-3PAPISID"))));
+        assert!(!has_login_cookie(".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tval\n"));
     }
 
     #[test]
