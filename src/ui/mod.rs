@@ -233,7 +233,9 @@ pub enum Action {
     Retry(View),
     ShowSignIn,
     HideSignIn,
-    SignInBrowser(String),
+    ScanBrowsers,
+    /// Sign in with the scanned profile at this index of `App::sign_in_scan`.
+    SignInBrowser(usize),
     SignInFile(String),
     SignOut,
     ToggleUserMenu,

@@ -1,6 +1,5 @@
 use super::{Action, COLOR_SURFACE, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY, Icon};
 use crate::LibraryChip;
-use crate::auth::ALLOWED_BROWSERS;
 use crate::backend::Card;
 use crate::App;
 
@@ -50,27 +49,72 @@ pub fn draw_sign_in_dialog(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<A
         .show(ui.ctx(), |ui| {
             ui.set_width(380.0);
             ui.label(
-                egui::RichText::new("Import cookies from a browser, or point at a cookies.txt file.")
-                    .color(COLOR_TEXT_SECONDARY)
+                egui::RichText::new("Signed-in browser profiles")
+                    .color(COLOR_TEXT_PRIMARY)
                     .size(13.0),
             );
-            ui.add_space(12.0);
-
-            ui.label(egui::RichText::new("Browser").color(COLOR_TEXT_PRIMARY).size(13.0));
-            egui::ComboBox::from_id_salt("signin_browser")
-                .selected_text(app.sign_in_browser.as_str())
-                .show_ui(ui, |ui| {
-                    for b in ALLOWED_BROWSERS {
-                        ui.selectable_value(&mut app.sign_in_browser, (*b).to_string(), *b);
-                    }
-                });
             ui.add_space(8.0);
-            let import_btn = ui.add_enabled(
-                !app.sign_in_busy,
-                egui::Button::new("Import from browser"),
-            );
-            if import_btn.clicked() {
-                actions.push(Action::SignInBrowser(app.sign_in_browser.clone()));
+            if app.sign_in_scanning {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Scanning browsers…")
+                            .color(COLOR_TEXT_SECONDARY)
+                            .size(13.0),
+                    );
+                });
+            } else {
+                let mut any = false;
+                for (idx, found) in app.sign_in_scan.iter().enumerate() {
+                    if found.status.is_ok() {
+                        any = true;
+                        ui.horizontal(|ui| {
+                            let use_btn = ui.add_enabled(!app.sign_in_busy, egui::Button::new("Use"));
+                            if use_btn.clicked() {
+                                actions.push(Action::SignInBrowser(idx));
+                            }
+                            ui.label(
+                                egui::RichText::new(&found.profile.label)
+                                    .color(COLOR_TEXT_PRIMARY)
+                                    .size(13.0),
+                            );
+                        });
+                    }
+                }
+                if !any {
+                    ui.label(
+                        egui::RichText::new("No browser profile is signed in to YouTube.")
+                            .color(COLOR_TEXT_SECONDARY)
+                            .size(13.0),
+                    );
+                }
+                let skipped: Vec<_> = app
+                    .sign_in_scan
+                    .iter()
+                    .filter_map(|r| r.status.as_ref().err().map(|e| (&r.profile.label, e)))
+                    .collect();
+                if !skipped.is_empty() {
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("{} other profiles", skipped.len()))
+                            .color(COLOR_TEXT_SECONDARY)
+                            .size(12.0),
+                    )
+                    .id_salt("signin_skipped")
+                    .default_open(!any)
+                    .show(ui, |ui| {
+                        for (label, err) in skipped {
+                            ui.label(
+                                egui::RichText::new(format!("{label}: {err}"))
+                                    .color(COLOR_TEXT_SECONDARY)
+                                    .size(12.0),
+                            );
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+                if ui.add_enabled(!app.sign_in_busy, egui::Button::new("Scan again")).clicked() {
+                    actions.push(Action::ScanBrowsers);
+                }
             }
 
             ui.add_space(12.0);

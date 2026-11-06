@@ -391,7 +391,9 @@ pub struct App {
     pub auth_error: Option<String>,
     pub show_sign_in: bool,
     pub sign_in_busy: bool,
-    pub sign_in_browser: String,
+    /// Browser profiles from the last scan (labels and paths, never cookies).
+    pub sign_in_scan: Vec<crate::auth::ScanResult>,
+    pub sign_in_scanning: bool,
     pub sign_in_file: String,
     pub show_user_menu: bool,
     pub auth_generation: u64,
@@ -499,7 +501,8 @@ impl App {
             auth_error: None,
             show_sign_in: false,
             sign_in_busy: false,
-            sign_in_browser: "firefox".to_string(),
+            sign_in_scan: Vec::new(),
+            sign_in_scanning: false,
             sign_in_file: String::new(),
             show_user_menu: false,
             auth_generation: 0,
@@ -861,7 +864,9 @@ impl App {
             Action::ShowSignIn => {
                 self.show_sign_in = true;
                 self.show_user_menu = false;
+                self.scan_browsers();
             }
+            Action::ScanBrowsers => self.scan_browsers(),
             Action::HideSignIn => {
                 // A sign-in may still be running on the backend; keep
                 // `sign_in_busy` so the buttons stay disabled and no second
@@ -871,10 +876,12 @@ impl App {
                     self.auth_error = None;
                 }
             }
-            Action::SignInBrowser(browser) => {
-                self.sign_in_busy = true;
-                self.auth_error = None;
-                self.backend.send(Cmd::SignIn(SignInSource::Browser(browser)));
+            Action::SignInBrowser(idx) => {
+                if let Some(found) = self.sign_in_scan.get(idx) {
+                    self.sign_in_busy = true;
+                    self.auth_error = None;
+                    self.backend.send(Cmd::SignIn(SignInSource::Browser(found.profile.clone())));
+                }
             }
             Action::SignInFile(path) => {
                 self.sign_in_busy = true;
@@ -945,6 +952,15 @@ impl App {
 }
 
 impl App {
+    /// Look for signed-in browser profiles, unless a scan is already running.
+    fn scan_browsers(&mut self) {
+        if !self.sign_in_scanning {
+            self.sign_in_scanning = true;
+            self.sign_in_scan.clear();
+            self.backend.send(Cmd::ScanBrowsers);
+        }
+    }
+
     /// Everything that must keep running without a visible window: backend
     /// events, auto-advance, media keys, the tray. `ctx` is `None` in Linux
     /// background mode, where the caller polls on a timer instead.
@@ -1088,6 +1104,10 @@ impl App {
                         self.fetch_error = Some(msg);
                         self.maybe_prefetch();
                     }
+                }
+                Event::BrowserScan(results) => {
+                    self.sign_in_scan = results;
+                    self.sign_in_scanning = false;
                 }
                 Event::Auth { signed_in, error } => {
                     // The feed asked for at startup is already this account's;

@@ -103,7 +103,7 @@ pub struct Library {
 
 #[derive(Debug, Clone)]
 pub enum SignInSource {
-    Browser(String),
+    Browser(crate::auth::BrowserProfile),
     File(PathBuf),
 }
 
@@ -122,6 +122,8 @@ pub enum Cmd {
     EnforceCache { max_bytes: u64, protect: HashSet<String> },
     CacheUsage,
     ClearCache { protect: HashSet<String> },
+    /// Try every installed browser profile; answers with `Event::BrowserScan`.
+    ScanBrowsers,
     SignIn(SignInSource),
     SignOut,
     LoadLibrary(u64),
@@ -151,6 +153,7 @@ pub enum Event {
     CacheUsage { bytes: u64, files: usize },
     FetchError { id: String, msg: String },
     Auth { signed_in: bool, error: Option<String> },
+    BrowserScan(Vec<crate::auth::ScanResult>),
     Library { generation: u64, library: Library },
     LibraryError { generation: u64, error: String },
     /// The video opened: in mpv (`None`), or it is at this URL for the browser
@@ -636,6 +639,89 @@ fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::Ru
     } else {
         q
     }
+}
+
+/// Import one browser profile via yt-dlp into a private temp jar (never the
+/// canonical file, removed afterwards) and return the raw jar when it holds a
+/// login cookie, else why not. On Linux, Chromium-family profiles are retried
+/// with the GNOME keyring: yt-dlp only auto-detects it on GNOME/KDE, elsewhere
+/// (Hyprland, sway...) it assumes none and cannot decrypt.
+async fn import_profile(p: &crate::auth::BrowserProfile, cookie_file: &Path) -> Result<String, String> {
+    let tmp = crate::auth::download_cookie_path(
+        cookie_file,
+        std::process::id(),
+        DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+    let result = async {
+        let try_keyring = cfg!(target_os = "linux") && p.browser != "firefox";
+        let mut reason = String::new();
+        for keyring in [false, true] {
+            if keyring && !try_keyring {
+                break;
+            }
+            let args = crate::auth::import_args(p.browser, p.profile.as_deref(), keyring, &tmp)
+                .ok_or_else(|| format!("Unsupported browser: {}", p.browser))?;
+            // 0600 placeholder BEFORE content lands.
+            crate::auth::write_cookie_file(&tmp, crate::auth::COOKIE_FILE_HEADER).await?;
+            let out = tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::process::Command::new("yt-dlp").args(&args).kill_on_drop(true).output(),
+            )
+            .await
+            .map_err(|_| "Browser import timed out".to_string())?
+            .map_err(|e| format!("Failed to run yt-dlp: {e}"))?;
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // yt-dlp exits 1 on the probe URL ("Unsupported URL") but still
+            // saves the jar on close: do NOT gate on exit status.
+            let raw = tokio::fs::read_to_string(&tmp).await.unwrap_or_default();
+            if crate::auth::has_login_cookie(&raw) {
+                return Ok(raw);
+            }
+            let no_secretstorage = stderr
+                .lines()
+                .any(|l| !l.starts_with("[debug]") && l.contains("secretstorage"));
+            reason = if keyring && no_secretstorage {
+                "the browser keeps its key in the GNOME keyring and yt-dlp needs the secretstorage module to read it: install python-secretstorage (Arch) or python3-secretstorage (Debian/Fedora), then retry".to_string()
+            } else {
+                crate::auth::import_error(&stderr)
+            };
+        }
+        Err(reason)
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result
+}
+
+/// Try every installed browser profile. Browsers run concurrently; profiles
+/// of one browser run one after another, so macOS shows at most one Keychain
+/// prompt per browser at a time. Results keep `scan_profiles` order.
+async fn scan_browsers(cookie_file: PathBuf) -> Vec<crate::auth::ScanResult> {
+    let profiles = tokio::task::spawn_blocking(crate::auth::scan_profiles)
+        .await
+        .unwrap_or_default();
+    let mut by_browser: Vec<Vec<(usize, crate::auth::BrowserProfile)>> = Vec::new();
+    for (i, p) in profiles.into_iter().enumerate() {
+        match by_browser.iter_mut().find(|g| g[0].1.browser == p.browser) {
+            Some(g) => g.push((i, p)),
+            None => by_browser.push(vec![(i, p)]),
+        }
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for group in by_browser {
+        let cookie_file = cookie_file.clone();
+        tasks.spawn(async move {
+            let mut out = Vec::new();
+            for (i, profile) in group {
+                let status = import_profile(&profile, &cookie_file).await.map(|_| ());
+                out.push((i, crate::auth::ScanResult { profile, status }));
+            }
+            out
+        });
+    }
+    let mut results: Vec<_> = tasks.join_all().await.into_iter().flatten().collect();
+    results.sort_by_key(|(i, _)| *i);
+    results.into_iter().map(|(_, r)| r).collect()
 }
 
 async fn fail_auth(
@@ -1231,71 +1317,11 @@ impl Backend {
                                     // Each arm returns the raw jar text; filtering,
                                     // the cookie check, and the 0600 write below
                                     // happen ONCE in shared code.
-                                    let (raw, import_stderr) = match source {
-                                        SignInSource::Browser(browser) => {
-                                            let args =
-                                                crate::auth::import_args(&browser, cookie_file)
-                                                    .ok_or_else(|| {
-                                                        format!("Unsupported browser: {browser}")
-                                                    })?;
-                                            // yt-dlp only auto-detects the keyring on
-                                            // GNOME/KDE; elsewhere (Hyprland, sway...) it
-                                            // assumes none, so Chromium cookies encrypted via
-                                            // libsecret fail to decrypt. Retry with the GNOME
-                                            // keyring when the first jar has no login cookie.
-                                            let try_keyring =
-                                                cfg!(target_os = "linux") && browser != "firefox";
-                                            let mut raw = String::new();
-                                            let mut stderr = String::new();
-                                            for keyring in [false, true] {
-                                                if keyring && !try_keyring {
-                                                    break;
-                                                }
-                                                let mut args = args.clone();
-                                                if keyring {
-                                                    args[1] = format!("{browser}+gnomekeyring");
-                                                }
-                                                // 0600 placeholder BEFORE content lands.
-                                                crate::auth::write_cookie_file(
-                                                    cookie_file,
-                                                    crate::auth::COOKIE_FILE_HEADER,
-                                                )
-                                                .await?;
-                                                let out = tokio::time::timeout(
-                                                    Duration::from_secs(60),
-                                                    tokio::process::Command::new("yt-dlp")
-                                                        .args(&args)
-                                                        .kill_on_drop(true)
-                                                        .output(),
-                                                )
+                                    let raw = match source {
+                                        SignInSource::Browser(profile) => {
+                                            import_profile(&profile, cookie_file)
                                                 .await
-                                                .map_err(|_| {
-                                                    "Browser import timed out".to_string()
-                                                })?
-                                                .map_err(|e| {
-                                                    format!("Failed to run yt-dlp: {e}")
-                                                })?;
-                                                stderr = String::from_utf8_lossy(&out.stderr)
-                                                    .into_owned();
-                                                // yt-dlp exits 1 on the probe URL ("Unsupported
-                                                // URL") but still saves the jar on close: do NOT
-                                                // gate on exit status. Only the file counts.
-                                                raw = tokio::fs::read_to_string(cookie_file)
-                                                    .await
-                                                    .map_err(|_| {
-                                                        format!(
-                                                            "Browser import failed: {}",
-                                                            crate::auth::short_error(&stderr)
-                                                        )
-                                                    })?;
-                                                if crate::auth::has_login_cookie(&raw) {
-                                                    break;
-                                                }
-                                                if keyring && stderr.contains("secretstorage") {
-                                                    return Err("No login cookies found. If you are signed in there, the browser keeps its key in the GNOME keyring and yt-dlp needs the secretstorage module to read it: install python-secretstorage (Arch) or python3-secretstorage (Debian/Fedora), then retry.".to_string());
-                                                }
-                                            }
-                                            (raw, Some(stderr))
+                                                .map_err(|e| format!("{}: {e}", profile.label))?
                                         }
                                         SignInSource::File(path) => {
                                             let src = tokio::task::spawn_blocking(move || {
@@ -1307,12 +1333,11 @@ impl Backend {
                                             .map_err(|e| {
                                                 format!("Cookie check task failed: {e}")
                                             })??;
-                                            let raw = tokio::fs::read_to_string(&src)
+                                            tokio::fs::read_to_string(&src)
                                                 .await
                                                 .map_err(|e| {
                                                     format!("Cannot read cookie file: {e}")
-                                                })?;
-                                            (raw, None)
+                                                })?
                                         }
                                     };
                                     // Drop every non-youtube/google cookie, and feed the
@@ -1320,15 +1345,7 @@ impl Backend {
                                     // when the jar holds no cookies at all.
                                     let filtered = crate::auth::filter_cookies(&raw);
                                     if !crate::auth::has_cookies(&filtered) {
-                                        match import_stderr.as_deref() {
-                                            Some(stderr) => {
-                                                return Err(format!(
-                                                    "Browser import failed: {}",
-                                                    crate::auth::short_error(stderr)
-                                                ));
-                                            }
-                                            None => return Err("No cookies found".to_string()),
-                                        }
+                                        return Err("No cookies found".to_string());
                                     }
                                     crate::auth::write_cookie_file(cookie_file, &filtered).await?;
                                     rp_ref
@@ -1373,6 +1390,14 @@ impl Backend {
                                         }
                                     }
                                 }
+                                ctx.request_repaint();
+                            }
+                            Cmd::ScanBrowsers => {
+                                let results = match cookie_file {
+                                    Some(cookie_file) => scan_browsers(cookie_file).await,
+                                    None => Vec::new(),
+                                };
+                                let _ = event_tx.send(Event::BrowserScan(results));
                                 ctx.request_repaint();
                             }
                             Cmd::SignOut => {
@@ -1665,6 +1690,9 @@ impl Backend {
                         }
                         Cmd::Prefetch(_) | Cmd::SetCachePolicy { .. } | Cmd::EnforceCache { .. }
                         | Cmd::CacheUsage | Cmd::ClearCache { .. } => {}
+                        Cmd::ScanBrowsers => {
+                            let _ = event_tx.send(Event::BrowserScan(Vec::new()));
+                        }
                         Cmd::SignIn(_) => {
                             let _ = event_tx.send(Event::Auth {
                                 signed_in: false,
