@@ -181,13 +181,23 @@ pub fn download_cookie_path(canonical: &Path, pid: u32, counter: u64) -> PathBuf
         .join(format!("cookies.{pid}.{counter}.tmp"))
 }
 
-/// True only for `cookies.<digits>.<digits>.tmp` leftovers from a crashed
-/// download; never `cookies.txt` or anything else.
+/// Private per-import dir holding a copy of one profile's cookie DB, named
+/// `cookie-db.<pid>.<counter>`. Sweeps alongside download copies.
+pub fn staged_cookie_db_dir(canonical: &Path, pid: u32, counter: u64) -> PathBuf {
+    canonical
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("cookie-db.{pid}.{counter}"))
+}
+
+/// True only for `cookies.<digits>.<digits>.tmp` and `cookie-db.<digits>.<digits>`
+/// leftovers from a crash; never `cookies.txt` or anything else.
 pub fn is_download_cookie_leftover(file_name: &str) -> bool {
-    let Some(rest) = file_name
+    let rest = file_name
         .strip_prefix("cookies.")
         .and_then(|s| s.strip_suffix(".tmp"))
-    else {
+        .or_else(|| file_name.strip_prefix("cookie-db."));
+    let Some(rest) = rest else {
         return false;
     };
     let mut parts = rest.split('.');
@@ -316,17 +326,16 @@ pub fn has_cookies(filtered: &str) -> bool {
     })
 }
 
-/// True iff the jar holds a YouTube login cookie (`SAPISID` or its
-/// `__Secure-` variants) on `.youtube.com`, the only domain rustypipe reads.
-/// A `.google.com`-only login (signed into Chrome, never into YouTube in that
-/// profile) or a failed decryption cannot authenticate.
+/// True iff the jar holds a first-party YouTube login cookie on `.youtube.com`,
+/// the only domain rustypipe reads. `__Secure-3PAPISID` alone is a third-party
+/// embed cookie that YouTube rejects as a session.
 pub fn has_login_cookie(jar: &str) -> bool {
     jar.lines().any(|line| {
         let mut cols = line.trim_start_matches("#HttpOnly_").split('\t');
         cols.next() == Some(".youtube.com")
             && cols
                 .nth(4)
-                .is_some_and(|name| name == "SAPISID" || name.ends_with("PAPISID"))
+                .is_some_and(|name| name == "SAPISID" || name == "__Secure-1PAPISID")
     })
 }
 
@@ -717,7 +726,8 @@ mod tests {
         assert!(!has_login_cookie(COOKIE_FILE_HEADER));
         assert!(!has_login_cookie(&line("VISITOR_INFO1_LIVE")));
         assert!(has_login_cookie(&line("SAPISID")));
-        assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-3PAPISID"))));
+        assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-1PAPISID"))));
+        assert!(!has_login_cookie(&line("__Secure-3PAPISID")));
         assert!(!has_login_cookie(".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tval\n"));
     }
 
@@ -768,6 +778,8 @@ mod tests {
         );
         assert!(is_download_cookie_leftover("cookies.123.1.tmp"));
         assert!(is_download_cookie_leftover("cookies.1.0.tmp"));
+        assert!(is_download_cookie_leftover("cookie-db.1.0"));
+        assert!(!is_download_cookie_leftover("cookie-db.1.0.1"));
     }
 
     #[test]

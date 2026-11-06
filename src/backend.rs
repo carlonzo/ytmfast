@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -641,6 +641,45 @@ fn authed_query(rp: &Arc<rustypipe::client::RustyPipe>) -> rustypipe::client::Ru
     }
 }
 
+/// Private copy of one profile's cookie DB, deleted on drop.
+struct StagedCookieDb(PathBuf);
+
+impl Drop for StagedCookieDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// yt-dlp given a profile dir walks all of it and reads the newest file named
+/// `Cookies`. Chrome 156 writes an empty one under `Storage/ext/glic`, which
+/// wins, so the copy goes in its own dir holding only the real DB.
+async fn stage_cookie_db(p: &crate::auth::BrowserProfile, cookie_file: &Path) -> Result<Option<StagedCookieDb>, String> {
+    let Some(dir) = p.profile.as_deref().filter(|_| p.browser != "firefox") else {
+        return Ok(None);
+    };
+    let Some(db) = ["Network/Cookies", "Cookies"]
+        .iter()
+        .map(|rel| dir.join(rel))
+        .find(|f| f.is_file())
+    else {
+        return Ok(None);
+    };
+    let staged = crate::auth::staged_cookie_db_dir(
+        cookie_file,
+        std::process::id(),
+        DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staged)
+        .map_err(|e| format!("Cannot create cookie staging dir: {e}"))?;
+    let guard = StagedCookieDb(staged.clone());
+    tokio::fs::copy(&db, staged.join("Cookies"))
+        .await
+        .map_err(|e| format!("Cannot copy cookie database: {e}"))?;
+    Ok(Some(guard))
+}
+
 /// Import one browser profile via yt-dlp into a private temp jar (never the
 /// canonical file, removed afterwards) and return the raw jar when it holds a
 /// login cookie, else why not. On Linux, Chromium-family profiles are retried
@@ -652,6 +691,8 @@ async fn import_profile(p: &crate::auth::BrowserProfile, cookie_file: &Path) -> 
         std::process::id(),
         DOWNLOAD_COOKIE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     );
+    let staged = stage_cookie_db(p, cookie_file).await?;
+    let profile = staged.as_ref().map(|s| s.0.as_path()).or(p.profile.as_deref());
     let result = async {
         let try_keyring = cfg!(target_os = "linux") && p.browser != "firefox";
         let mut reason = String::new();
@@ -659,7 +700,7 @@ async fn import_profile(p: &crate::auth::BrowserProfile, cookie_file: &Path) -> 
             if keyring && !try_keyring {
                 break;
             }
-            let args = crate::auth::import_args(p.browser, p.profile.as_deref(), keyring, &tmp)
+            let args = crate::auth::import_args(p.browser, profile, keyring, &tmp)
                 .ok_or_else(|| format!("Unsupported browser: {}", p.browser))?;
             // 0600 placeholder BEFORE content lands.
             crate::auth::write_cookie_file(&tmp, crate::auth::COOKIE_FILE_HEADER).await?;
@@ -830,8 +871,9 @@ impl Backend {
             {
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
             }
-            // Delete leftover `cookies.<pid>.<counter>.tmp` copies from
-            // crashed downloads; the canonical `cookies.txt` is untouched.
+            // Delete leftover `cookies.<pid>.<counter>.tmp` copies and
+            // `cookie-db.<pid>.<counter>` dirs from crashed imports; the
+            // canonical `cookies.txt` is untouched.
             if let Some(path) = &cookie_file
                 && let Some(dir) = path.parent()
                 && let Ok(entries) = std::fs::read_dir(dir)
@@ -840,7 +882,12 @@ impl Backend {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
                     if crate::auth::is_download_cookie_leftover(&name) {
-                        let _ = std::fs::remove_file(entry.path());
+                        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                        let _ = if is_dir {
+                            std::fs::remove_dir_all(entry.path())
+                        } else {
+                            std::fs::remove_file(entry.path())
+                        };
                     }
                 }
             }
