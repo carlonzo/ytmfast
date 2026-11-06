@@ -10,6 +10,150 @@ pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome"
 #[cfg(target_os = "macos")]
 pub const ALLOWED_BROWSERS: &[&str] = &["brave", "firefox", "chromium", "chrome", "safari"];
 
+/// One browser profile found on disk. `profile` is the absolute profile dir
+/// (`None` for Safari, which has no profiles in yt-dlp).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProfile {
+    pub browser: &'static str,
+    pub profile: Option<PathBuf>,
+    pub label: String,
+}
+
+/// Outcome of trying one profile during a scan.
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    pub profile: BrowserProfile,
+    /// `Ok` when the profile holds a Google login cookie, else why not.
+    pub status: Result<(), String>,
+}
+
+/// Chromium-family user-data dirs, mirroring yt-dlp's
+/// `_get_chromium_based_browser_settings` (relative to the config dir:
+/// `~/.config` on Linux, `~/Library/Application Support` on macOS).
+#[cfg(not(target_os = "macos"))]
+const CHROMIUM_DIRS: &[(&str, &str, &str)] = &[
+    ("chrome", "Chrome", "google-chrome"),
+    ("chromium", "Chromium", "chromium"),
+    ("brave", "Brave", "BraveSoftware/Brave-Browser"),
+];
+#[cfg(target_os = "macos")]
+const CHROMIUM_DIRS: &[(&str, &str, &str)] = &[
+    ("chrome", "Chrome", "Google/Chrome"),
+    ("chromium", "Chromium", "Chromium"),
+    ("brave", "Brave", "BraveSoftware/Brave-Browser"),
+];
+
+/// Firefox profile roots, mirroring yt-dlp's `_firefox_browser_dirs`.
+fn firefox_roots(home: &Path, config: &Path) -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        vec![config.join("Firefox/Profiles")]
+    } else {
+        vec![
+            config.join("mozilla/firefox"),
+            home.join(".mozilla/firefox"),
+            home.join(".var/app/org.mozilla.firefox/config/mozilla/firefox"),
+            home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+            home.join("snap/firefox/common/.mozilla/firefox"),
+        ]
+    }
+}
+
+/// Sorted subdirs of `root`; empty when it is missing or unreadable.
+fn subdirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Profiles of one Chromium-family browser: every subdir holding a cookie DB
+/// (`Cookies` or `Network/Cookies`), labelled from `Local State`
+/// (`profile.info_cache.<dir>.name` and `.user_name`, the Google account).
+fn chromium_profiles(browser: &'static str, display: &str, root: &Path) -> Vec<BrowserProfile> {
+    let info: serde_json::Value = std::fs::read_to_string(root.join("Local State"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let cache = &info["profile"]["info_cache"];
+    subdirs(root)
+        .into_iter()
+        .filter(|p| p.join("Cookies").is_file() || p.join("Network/Cookies").is_file())
+        .filter_map(|p| {
+            let dir = p.file_name()?.to_str()?.to_string();
+            if dir == "System Profile" || dir == "Guest Profile" {
+                return None;
+            }
+            let entry = &cache[dir.as_str()];
+            let name = entry["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(&dir);
+            let label = match entry["user_name"].as_str().filter(|s| !s.is_empty()) {
+                Some(email) => format!("{display} · {name} ({email})"),
+                None => format!("{display} · {name}"),
+            };
+            Some(BrowserProfile { browser, profile: Some(p), label })
+        })
+        .collect()
+}
+
+/// Firefox profiles: subdirs of each root holding `cookies.sqlite`. The
+/// label drops the random `xxxxxxxx.` prefix of the dir name.
+fn firefox_profiles(root: &Path) -> Vec<BrowserProfile> {
+    subdirs(root)
+        .into_iter()
+        .filter(|p| p.join("cookies.sqlite").is_file())
+        .filter_map(|p| {
+            let dir = p.file_name()?.to_str()?;
+            let name = dir.split_once('.').map_or(dir, |(_, n)| n).to_string();
+            Some(BrowserProfile { browser: "firefox", profile: Some(p), label: format!("Firefox · {name}") })
+        })
+        .collect()
+}
+
+/// `found`, or, when the browser dir exists but no profile could be listed
+/// (e.g. macOS privacy blocks reading it), one profile-less entry so yt-dlp
+/// still tries it and its error reaches the user instead of the browser
+/// silently vanishing from the scan.
+fn or_whole_browser(
+    found: Vec<BrowserProfile>,
+    root: &Path,
+    browser: &'static str,
+    display: &str,
+) -> Vec<BrowserProfile> {
+    if found.is_empty() && std::fs::symlink_metadata(root).is_ok() {
+        vec![BrowserProfile { browser, profile: None, label: display.to_string() }]
+    } else {
+        found
+    }
+}
+
+/// Every installed browser profile that could hold YouTube cookies. Cheap:
+/// directory listings plus one small JSON read per Chromium browser. Browsers
+/// that are not installed have no dir and simply do not show up.
+pub fn scan_profiles() -> Vec<BrowserProfile> {
+    let Some(base) = directories::BaseDirs::new() else {
+        return Vec::new();
+    };
+    let (home, config) = (base.home_dir(), base.config_dir());
+    let mut out = Vec::new();
+    for (b, display, rel) in CHROMIUM_DIRS {
+        let root = config.join(rel);
+        out.extend(or_whole_browser(chromium_profiles(b, display, &root), &root, b, display));
+    }
+    for root in firefox_roots(home, config) {
+        out.extend(or_whole_browser(firefox_profiles(&root), &root, "firefox", "Firefox"));
+    }
+    // Safari's jar sits in a sandboxed container we cannot even stat without
+    // Full Disk Access; always offer it and let yt-dlp report the failure.
+    if cfg!(target_os = "macos") {
+        out.push(BrowserProfile { browser: "safari", profile: None, label: "Safari".to_string() });
+    }
+    out
+}
+
 /// Reject user-typed cookie files larger than this (checked via metadata first).
 pub const MAX_COOKIE_FILE_BYTES: u64 = 1024 * 1024;
 /// Placeholder written 0600 before a browser import lands: yt-dlp refuses
@@ -37,13 +181,23 @@ pub fn download_cookie_path(canonical: &Path, pid: u32, counter: u64) -> PathBuf
         .join(format!("cookies.{pid}.{counter}.tmp"))
 }
 
-/// True only for `cookies.<digits>.<digits>.tmp` leftovers from a crashed
-/// download; never `cookies.txt` or anything else.
+/// Private per-import dir holding a copy of one profile's cookie DB, named
+/// `cookie-db.<pid>.<counter>`. Sweeps alongside download copies.
+pub fn staged_cookie_db_dir(canonical: &Path, pid: u32, counter: u64) -> PathBuf {
+    canonical
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("cookie-db.{pid}.{counter}"))
+}
+
+/// True only for `cookies.<digits>.<digits>.tmp` and `cookie-db.<digits>.<digits>`
+/// leftovers from a crash; never `cookies.txt` or anything else.
 pub fn is_download_cookie_leftover(file_name: &str) -> bool {
-    let Some(rest) = file_name
+    let rest = file_name
         .strip_prefix("cookies.")
         .and_then(|s| s.strip_suffix(".tmp"))
-    else {
+        .or_else(|| file_name.strip_prefix("cookie-db."));
+    let Some(rest) = rest else {
         return false;
     };
     let mut parts = rest.split('.');
@@ -63,23 +217,59 @@ pub fn is_allowed_browser(browser: &str) -> bool {
     ALLOWED_BROWSERS.contains(&browser)
 }
 
+/// yt-dlp browser spec `browser[+gnomekeyring][:profile]`. The profile is an
+/// absolute path, which yt-dlp uses as-is (any value containing `/` is a path).
+pub fn browser_spec(browser: &str, profile: Option<&Path>, gnome_keyring: bool) -> String {
+    let mut spec = browser.to_string();
+    if gnome_keyring {
+        spec.push_str("+gnomekeyring");
+    }
+    if let Some(p) = profile {
+        spec.push(':');
+        spec.push_str(&p.to_string_lossy());
+    }
+    spec
+}
+
 /// argv for the browser cookie import:
-/// `yt-dlp --cookies-from-browser <b> --cookies <out> --skip-download -q --no-warnings https://music.youtube.com`
-/// Returns `None` for browsers outside the allowlist.
-pub fn import_args(browser: &str, out: &Path) -> Option<Vec<String>> {
+/// `yt-dlp -v --cookies-from-browser <spec> --cookies <out> --skip-download https://music.youtube.com`
+/// `-v` so a failure leaves yt-dlp's decrypt/keyring lines in stderr for
+/// [`import_error`]. Returns `None` for browsers outside the allowlist.
+pub fn import_args(
+    browser: &str,
+    profile: Option<&Path>,
+    gnome_keyring: bool,
+    out: &Path,
+) -> Option<Vec<String>> {
     if !is_allowed_browser(browser) {
         return None;
     }
     Some(vec![
+        "-v".to_string(),
         "--cookies-from-browser".to_string(),
-        browser.to_string(),
+        browser_spec(browser, profile, gnome_keyring),
         "--cookies".to_string(),
         out.to_string_lossy().into_owned(),
         "--skip-download".to_string(),
-        "-q".to_string(),
-        "--no-warnings".to_string(),
         "https://music.youtube.com".to_string(),
     ])
+}
+
+/// Why an import yielded no login cookie, from yt-dlp's verbose stderr: the
+/// first `WARNING:`/`ERROR:` line or "N could not be decrypted" summary,
+/// minus the expected noise from the probe URL. yt-dlp never prints cookie
+/// values. Falls back to "not signed in to YouTube".
+pub fn import_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            (l.starts_with("WARNING:") || l.starts_with("ERROR:") || l.contains("could not be decrypted"))
+                && !l.contains("Unsupported URL")
+                && !l.contains("Falling back on generic")
+        })
+        .map(short_error)
+        .unwrap_or_else(|| "not signed in to YouTube".to_string())
 }
 
 /// True for `youtube.com`/`.youtube.com` or `google.com`/`.google.com`
@@ -136,14 +326,16 @@ pub fn has_cookies(filtered: &str) -> bool {
     })
 }
 
-/// True iff the jar holds a Google login cookie (`SAPISID` or its
-/// `__Secure-` variants). A jar without one cannot authenticate, which is
-/// what a browser import yields when cookie decryption failed.
+/// True iff the jar holds a first-party YouTube login cookie on `.youtube.com`,
+/// the only domain rustypipe reads. `__Secure-3PAPISID` alone is a third-party
+/// embed cookie that YouTube rejects as a session.
 pub fn has_login_cookie(jar: &str) -> bool {
     jar.lines().any(|line| {
-        line.split('\t')
-            .nth(5)
-            .is_some_and(|name| name == "SAPISID" || name.ends_with("PAPISID"))
+        let mut cols = line.trim_start_matches("#HttpOnly_").split('\t');
+        cols.next() == Some(".youtube.com")
+            && cols
+                .nth(4)
+                .is_some_and(|name| name == "SAPISID" || name == "__Secure-1PAPISID")
     })
 }
 
@@ -300,32 +492,104 @@ mod tests {
     #[test]
     fn test_import_args_exact_argv() {
         let out = Path::new("/home/u/.config/ytmfast/cookies.txt");
+        let profile = Path::new("/home/u/.config/google-chrome/Profile 1");
         assert_eq!(
-            import_args("firefox", out),
+            import_args("chrome", Some(profile), true, out),
             Some(vec![
+                "-v".to_string(),
                 "--cookies-from-browser".to_string(),
-                "firefox".to_string(),
+                "chrome+gnomekeyring:/home/u/.config/google-chrome/Profile 1".to_string(),
                 "--cookies".to_string(),
                 "/home/u/.config/ytmfast/cookies.txt".to_string(),
                 "--skip-download".to_string(),
-                "-q".to_string(),
-                "--no-warnings".to_string(),
                 "https://music.youtube.com".to_string(),
             ])
         );
+        assert_eq!(browser_spec("firefox", None, false), "firefox");
+        assert_eq!(browser_spec("chrome", Some(profile), false), "chrome:/home/u/.config/google-chrome/Profile 1");
         for b in ALLOWED_BROWSERS {
-            assert!(import_args(b, out).is_some(), "{b} must be allowed");
+            assert!(import_args(b, None, false, out).is_some(), "{b} must be allowed");
         }
     }
 
     #[test]
     fn test_import_args_rejects_non_allowlisted() {
         let out = Path::new("/tmp/cookies.txt");
-        assert_eq!(import_args("firefox; rm -rf", out), None);
-        assert_eq!(import_args("edge", out), None);
-        assert_eq!(import_args("", out), None);
-        assert_eq!(import_args("Firefox", out), None);
-        assert_eq!(import_args(" firefox", out), None);
+        for b in ["firefox; rm -rf", "edge", "", "Firefox", " firefox"] {
+            assert_eq!(import_args(b, None, false, out), None, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn test_scan_chromium_and_firefox_profiles() {
+        let root = std::env::temp_dir().join(format!("ytmfast-test-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let chrome = root.join("chrome");
+        for (dir, db) in [
+            ("Default", "Cookies"),
+            ("Profile 1", "Network/Cookies"),
+            ("Profile 2", "Cookies"),
+            ("Guest Profile", "Cookies"),
+            ("Crashpad", "settings.dat"),
+        ] {
+            let f = chrome.join(dir).join(db);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "").unwrap();
+        }
+        std::fs::write(
+            chrome.join("Local State"),
+            r#"{"profile":{"info_cache":{
+                "Default":{"name":"Personal","user_name":"me@gmail.com"},
+                "Profile 1":{"name":"Work","user_name":""}}}}"#,
+        )
+        .unwrap();
+        let labels: Vec<_> = chromium_profiles("chrome", "Chrome", &chrome)
+            .into_iter()
+            .map(|p| (p.label, p.profile.unwrap()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("Chrome · Personal (me@gmail.com)".to_string(), chrome.join("Default")),
+                ("Chrome · Work".to_string(), chrome.join("Profile 1")),
+                ("Chrome · Profile 2".to_string(), chrome.join("Profile 2")),
+            ]
+        );
+
+        let ff = root.join("firefox");
+        for dir in ["abcd1234.default-release", "zz.work"] {
+            std::fs::create_dir_all(ff.join(dir)).unwrap();
+            std::fs::write(ff.join(dir).join("cookies.sqlite"), "").unwrap();
+        }
+        std::fs::create_dir_all(ff.join("Crash Reports")).unwrap();
+        let labels: Vec<_> = firefox_profiles(&ff).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, vec!["Firefox · default-release", "Firefox · work"]);
+
+        // Missing browser dir: nothing. Existing dir with no listable profile:
+        // one whole-browser entry, so yt-dlp's own error reaches the user.
+        assert!(or_whole_browser(Vec::new(), &root.join("nope"), "brave", "Brave").is_empty());
+        let empty = root.join("brave");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            or_whole_browser(chromium_profiles("brave", "Brave", &empty), &empty, "brave", "Brave"),
+            vec![BrowserProfile { browser: "brave", profile: None, label: "Brave".to_string() }]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_import_error_picks_reason() {
+        let stderr = "[debug] Command-line config: ['-v']\n\
+            Extracting cookies from chromium\n\
+            [debug] Chosen keyring: BASICTEXT\n\
+            WARNING: cannot decrypt v11 cookies: no key found\n\
+            Extracted 0 cookies from chromium (1738 could not be decrypted)\n\
+            WARNING: [generic] Falling back on generic information extractor\n\
+            ERROR: Unsupported URL: https://music.youtube.com/\n\
+            raise UnsupportedError(url)\n";
+        assert_eq!(import_error(stderr), "WARNING: cannot decrypt v11 cookies: no key found");
+        let clean = "Extracted 40 cookies from firefox\nERROR: Unsupported URL: https://music.youtube.com/\n";
+        assert_eq!(import_error(clean), "not signed in to YouTube");
     }
 
     #[test]
@@ -462,7 +726,9 @@ mod tests {
         assert!(!has_login_cookie(COOKIE_FILE_HEADER));
         assert!(!has_login_cookie(&line("VISITOR_INFO1_LIVE")));
         assert!(has_login_cookie(&line("SAPISID")));
-        assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-3PAPISID"))));
+        assert!(has_login_cookie(&format!("#HttpOnly_{}", line("__Secure-1PAPISID"))));
+        assert!(!has_login_cookie(&line("__Secure-3PAPISID")));
+        assert!(!has_login_cookie(".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tval\n"));
     }
 
     #[test]
@@ -512,6 +778,8 @@ mod tests {
         );
         assert!(is_download_cookie_leftover("cookies.123.1.tmp"));
         assert!(is_download_cookie_leftover("cookies.1.0.tmp"));
+        assert!(is_download_cookie_leftover("cookie-db.1.0"));
+        assert!(!is_download_cookie_leftover("cookie-db.1.0.1"));
     }
 
     #[test]

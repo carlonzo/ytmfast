@@ -85,9 +85,11 @@ cargo build --release
 
 ## Signing in
 
-Sign-in is optional. The dialog either imports cookies from a browser where
-you are already signed in to YouTube Music (via `yt-dlp
---cookies-from-browser`) or reads a `cookies.txt` file you point it at.
+Sign-in is optional. Opening the dialog scans every installed browser
+profile (Chrome, Chromium, Brave and Firefox, plus Safari on macOS) through
+`yt-dlp --cookies-from-browser` and lists the ones signed in to YouTube. Pick
+one, or point the dialog at a `cookies.txt` file. Profiles that are not
+signed in are listed under "other profiles" with the reason.
 
 Only `youtube.com` and `google.com` cookies are kept. They are stored in
 `~/.config/ytmfast/cookies.txt` with mode `0600` and removed when you sign
