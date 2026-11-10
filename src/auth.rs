@@ -217,6 +217,9 @@ pub fn is_allowed_browser(browser: &str) -> bool {
     ALLOWED_BROWSERS.contains(&browser)
 }
 
+/// Offline URL yt-dlp rejects before any request (file URLs are off by default).
+const IMPORT_PROBE_URL: &str = "file:///dev/null";
+
 /// yt-dlp browser spec `browser[+gnomekeyring][:profile]`. The profile is an
 /// absolute path, which yt-dlp uses as-is (any value containing `/` is a path).
 pub fn browser_spec(browser: &str, profile: Option<&Path>, gnome_keyring: bool) -> String {
@@ -232,9 +235,10 @@ pub fn browser_spec(browser: &str, profile: Option<&Path>, gnome_keyring: bool) 
 }
 
 /// argv for the browser cookie import:
-/// `yt-dlp -v --cookies-from-browser <spec> --cookies <out> --skip-download https://music.youtube.com`
+/// `yt-dlp -v --cookies-from-browser <spec> --cookies <out> --skip-download file:///dev/null`
 /// `-v` so a failure leaves yt-dlp's decrypt/keyring lines in stderr for
 /// [`import_error`]. Returns `None` for browsers outside the allowlist.
+/// Probe must stay off the network: YouTube's reply expires login cookies and yt-dlp saves that jar.
 pub fn import_args(
     browser: &str,
     profile: Option<&Path>,
@@ -251,7 +255,7 @@ pub fn import_args(
         "--cookies".to_string(),
         out.to_string_lossy().into_owned(),
         "--skip-download".to_string(),
-        "https://music.youtube.com".to_string(),
+        IMPORT_PROBE_URL.to_string(),
     ])
 }
 
@@ -502,7 +506,7 @@ mod tests {
                 "--cookies".to_string(),
                 "/home/u/.config/ytmfast/cookies.txt".to_string(),
                 "--skip-download".to_string(),
-                "https://music.youtube.com".to_string(),
+                IMPORT_PROBE_URL.to_string(),
             ])
         );
         assert_eq!(browser_spec("firefox", None, false), "firefox");
